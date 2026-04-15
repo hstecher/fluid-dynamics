@@ -315,78 +315,9 @@ LIGHT_DIR = LIGHT_DIR / np.linalg.norm(LIGHT_DIR)
 VIEW_DIR = np.array([0.0, 0.0, 1.0])
 
 RES = 700
-framebuf = ti.Vector.field(3, dtype=ti.f32, shape=(RES, RES))
 
 HALF_VEC = LIGHT_DIR + VIEW_DIR
 HALF_VEC = HALF_VEC / np.linalg.norm(HALF_VEC)
-
-# Triangle data for rasterizer
-MAX_TRIS = 30000
-tri_v0 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIS)
-tri_v1 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIS)
-tri_v2 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIS)
-tri_n0 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIS)
-tri_n1 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIS)
-tri_n2 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIS)
-
-ti_light_dir = ti.Vector([float(LIGHT_DIR[0]), float(LIGHT_DIR[1]), float(LIGHT_DIR[2])])
-ti_half_vec = ti.Vector([float(HALF_VEC[0]), float(HALF_VEC[1]), float(HALF_VEC[2])])
-
-
-@ti.func
-def shade_normal(n: ti.template()) -> ti.template():
-    nn = n.normalized()
-    ndotl = ti.max(nn.dot(ti_light_dir), 0.0)
-    ndoth = ti.max(nn.dot(ti_half_vec), 0.0)
-    spec = ndoth ** 40
-    r = ti.math.clamp(0.05 + 0.15 * ndotl + 0.6 * spec, 0.0, 1.0)
-    g = ti.math.clamp(0.12 + 0.25 * ndotl + 0.6 * spec, 0.0, 1.0)
-    b = ti.math.clamp(0.25 + 0.40 * ndotl + 0.7 * spec, 0.0, 1.0)
-    return ti.Vector([r, g, b])
-
-
-@ti.func
-def edge_func(a: ti.template(), b: ti.template(), c: ti.template()) -> ti.f32:
-    return (c.x - a.x) * (b.y - a.y) - (c.y - a.y) * (b.x - a.x)
-
-
-@ti.kernel
-def clear_framebuf():
-    for i, j in framebuf:
-        framebuf[i, j] = ti.Vector([0.05, 0.05, 0.08])
-
-
-@ti.kernel
-def rasterize_tri(t: ti.i32):
-    """Rasterize a single triangle — called sequentially per tri (painter's order)."""
-    v0 = tri_v0[t]
-    v1 = tri_v1[t]
-    v2 = tri_v2[t]
-    n0 = tri_n0[t]
-    n1 = tri_n1[t]
-    n2 = tri_n2[t]
-
-    min_x = ti.max(int(ti.floor(ti.min(v0.x, ti.min(v1.x, v2.x)))), 0)
-    max_x = ti.min(int(ti.ceil(ti.max(v0.x, ti.max(v1.x, v2.x)))), RES - 1)
-    min_y = ti.max(int(ti.floor(ti.min(v0.y, ti.min(v1.y, v2.y)))), 0)
-    max_y = ti.min(int(ti.ceil(ti.max(v0.y, ti.max(v1.y, v2.y)))), RES - 1)
-
-    area = edge_func(v0, v1, v2)
-    if ti.abs(area) > 1.0:
-        if area < 0.0:
-            v0, v1 = v1, v0
-            n0, n1 = n1, n0
-            area = -area
-        inv_area = 1.0 / area
-        for px in range(min_x, max_x + 1):
-            for py in range(min_y, max_y + 1):
-                p = ti.Vector([float(px) + 0.5, float(py) + 0.5, 0.0])
-                w0 = edge_func(v1, v2, p) * inv_area
-                w1 = edge_func(v2, v0, p) * inv_area
-                w2 = 1.0 - w0 - w1
-                if w0 >= 0.0 and w1 >= 0.0 and w2 >= 0.0:
-                    interp_n = w0 * n0 + w1 * n1 + w2 * n2
-                    framebuf[px, py] = shade_normal(interp_n)
 
 
 def transform_verts(verts):
@@ -458,40 +389,37 @@ def main():
             verts += DOMAIN_MIN
 
             if len(faces) > 0:
-                # Per-face normal for shading
-                face_normals = normals[faces].mean(axis=1)
-                rot_fn = rotate_normals(face_normals)
-
-                # Blinn-Phong per face
-                ndotl = np.einsum('ij,j->i', rot_fn, LIGHT_DIR).clip(0, 1)
-                ndoth = np.einsum('ij,j->i', rot_fn, HALF_VEC).clip(0, 1)
+                # Shade per-vertex, then average per triangle for smooth look
+                rot_n = rotate_normals(normals)
+                ndotl = np.einsum('ij,j->i', rot_n, LIGHT_DIR).clip(0, 1)
+                ndoth = np.einsum('ij,j->i', rot_n, HALF_VEC).clip(0, 1)
                 spec = ndoth ** 40
-                face_colors_r = (0.05 + 0.15 * ndotl + 0.6 * spec).clip(0, 1)
-                face_colors_g = (0.12 + 0.25 * ndotl + 0.6 * spec).clip(0, 1)
-                face_colors_b = (0.25 + 0.40 * ndotl + 0.7 * spec).clip(0, 1)
+                vert_r = (0.05 + 0.15 * ndotl + 0.6 * spec).clip(0, 1)
+                vert_g = (0.12 + 0.25 * ndotl + 0.6 * spec).clip(0, 1)
+                vert_b = (0.25 + 0.40 * ndotl + 0.7 * spec).clip(0, 1)
+
+                # Per-triangle color = average of 3 vertex colors
+                fr = ((vert_r[faces[:, 0]] + vert_r[faces[:, 1]] + vert_r[faces[:, 2]]) / 3.0 * 255).astype(np.int32)
+                fg = ((vert_g[faces[:, 0]] + vert_g[faces[:, 1]] + vert_g[faces[:, 2]]) / 3.0 * 255).astype(np.int32)
+                fb = ((vert_b[faces[:, 0]] + vert_b[faces[:, 1]] + vert_b[faces[:, 2]]) / 3.0 * 255).astype(np.int32)
+                hex_colors = (fr << 16) | (fg << 8) | fb
 
                 # Transform to normalized screen coords [0, 1]
                 screen_verts = transform_verts(verts)
-                sv_norm = screen_verts.copy()
-                sv_norm[:, 0] /= RES
-                sv_norm[:, 1] /= RES
+                sv = screen_verts.copy()
+                sv[:, 0] /= RES
+                sv[:, 1] /= RES
 
-                # Painter's algorithm: sort back to front
+                # Painter's algorithm
                 face_z = (screen_verts[faces[:, 0], 2] +
                           screen_verts[faces[:, 1], 2] +
                           screen_verts[faces[:, 2], 2]) / 3.0
                 order = np.argsort(face_z)
 
-                a = sv_norm[faces[order, 0], :2]
-                b_pt = sv_norm[faces[order, 1], :2]
-                c_pt = sv_norm[faces[order, 2], :2]
-
-                r = (face_colors_r[order] * 255).astype(np.int32)
-                g = (face_colors_g[order] * 255).astype(np.int32)
-                b = (face_colors_b[order] * 255).astype(np.int32)
-                hex_colors = (r << 16) | (g << 8) | b
-
-                gui.triangles(a, b_pt, c_pt, color=hex_colors)
+                gui.triangles(sv[faces[order, 0], :2],
+                              sv[faces[order, 1], :2],
+                              sv[faces[order, 2], :2],
+                              color=hex_colors[order])
         except (ValueError, IndexError):
             pass
         gui.show()
