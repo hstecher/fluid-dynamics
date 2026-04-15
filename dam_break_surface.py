@@ -316,12 +316,91 @@ MOUSE_RADIUS = 0.2         # world-space radius of influence
 MOUSE_STRENGTH = 3.0       # direct velocity impulse
 
 mouse_pos = ti.Vector.field(3, dtype=ti.f32, shape=())
-mouse_active = ti.field(dtype=ti.i32, shape=())
+
+# Framebuffer for smooth-shaded software rasterizer
+framebuf = ti.Vector.field(3, dtype=ti.f32, shape=(RES, RES))
+
+# Triangle data
+MAX_TRIS = 30000
+tri_v0 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIS)
+tri_v1 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIS)
+tri_v2 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIS)
+tri_n0 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIS)
+tri_n1 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIS)
+tri_n2 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIS)
+
+ti_light_dir = ti.Vector([float(LIGHT_DIR[0]), float(LIGHT_DIR[1]), float(LIGHT_DIR[2])])
+ti_half_vec = ti.Vector([float(HALF_VEC[0]), float(HALF_VEC[1]), float(HALF_VEC[2])])
+
+
+@ti.func
+def shade_normal(n: ti.template()) -> ti.template():
+    nn = n.normalized()
+    ndotl = ti.max(nn.dot(ti_light_dir), 0.0)
+    ndoth = ti.max(nn.dot(ti_half_vec), 0.0)
+    spec = ndoth ** 40
+    r = ti.math.clamp(0.05 + 0.15 * ndotl + 0.6 * spec, 0.0, 1.0)
+    g = ti.math.clamp(0.12 + 0.25 * ndotl + 0.6 * spec, 0.0, 1.0)
+    b = ti.math.clamp(0.25 + 0.40 * ndotl + 0.7 * spec, 0.0, 1.0)
+    return ti.Vector([r, g, b])
+
+
+@ti.func
+def edge_func(a: ti.template(), b: ti.template(), c: ti.template()) -> ti.f32:
+    return (c.x - a.x) * (b.y - a.y) - (c.y - a.y) * (b.x - a.x)
+
+
+zbuf = ti.field(dtype=ti.i32, shape=(RES, RES))  # integer Z for atomic_max
+
+
+@ti.kernel
+def clear_framebuf():
+    for i, j in framebuf:
+        framebuf[i, j] = ti.Vector([0.05, 0.05, 0.08])
+        zbuf[i, j] = -2147483647
+
+
+@ti.kernel
+def rasterize_batch(batch_start: ti.i32, batch_end: ti.i32):
+    """Rasterize triangles with per-pixel smooth shading and atomic Z-buffer."""
+    for t in range(batch_start, batch_end):
+        v0 = tri_v0[t]
+        v1 = tri_v1[t]
+        v2 = tri_v2[t]
+        n0 = tri_n0[t]
+        n1 = tri_n1[t]
+        n2 = tri_n2[t]
+
+        min_x = ti.max(int(ti.floor(ti.min(v0.x, ti.min(v1.x, v2.x)))), 0)
+        max_x = ti.min(int(ti.ceil(ti.max(v0.x, ti.max(v1.x, v2.x)))), RES - 1)
+        min_y = ti.max(int(ti.floor(ti.min(v0.y, ti.min(v1.y, v2.y)))), 0)
+        max_y = ti.min(int(ti.ceil(ti.max(v0.y, ti.max(v1.y, v2.y)))), RES - 1)
+
+        area = edge_func(v0, v1, v2)
+        if ti.abs(area) > 1.0:
+            if area < 0.0:
+                v0, v1 = v1, v0
+                n0, n1 = n1, n0
+                area = -area
+            inv_area = 1.0 / area
+            for px in range(min_x, max_x + 1):
+                for py in range(min_y, max_y + 1):
+                    p = ti.Vector([float(px) + 0.5, float(py) + 0.5, 0.0])
+                    w0 = edge_func(v1, v2, p) * inv_area
+                    w1 = edge_func(v2, v0, p) * inv_area
+                    w2 = 1.0 - w0 - w1
+                    if w0 >= 0.0 and w1 >= 0.0 and w2 >= 0.0:
+                        z = w0 * v0.z + w1 * v1.z + w2 * v2.z
+                        # Scale Z to int for atomic_max (avoids float race)
+                        z_int = int(z * 1e6)
+                        old = ti.atomic_max(zbuf[px, py], z_int)
+                        if z_int >= old:
+                            interp_n = w0 * n0 + w1 * n1 + w2 * n2
+                            framebuf[px, py] = shade_normal(interp_n)
 
 
 @ti.kernel
 def apply_mouse_force():
-    """Push particles away from mouse position in world space."""
     mp = mouse_pos[None]
     for i in range(NUM_FLUID):
         r = pos[i] - mp
@@ -437,6 +516,7 @@ def main():
                 update_velocity()
 
         # Surface reconstruction and rendering
+        clear_framebuf()
         splat_density()
         dg = density_grid.to_numpy()
         try:
@@ -445,35 +525,29 @@ def main():
             verts += DOMAIN_MIN
 
             if len(faces) > 0:
-                rot_n = rotate_normals(normals, cam_angle, cam_tilt)
-                ndotl = np.einsum('ij,j->i', rot_n, LIGHT_DIR).clip(0, 1)
-                ndoth = np.einsum('ij,j->i', rot_n, HALF_VEC).clip(0, 1)
-                spec = ndoth ** 40
-                vert_r = (0.05 + 0.15 * ndotl + 0.6 * spec).clip(0, 1)
-                vert_g = (0.12 + 0.25 * ndotl + 0.6 * spec).clip(0, 1)
-                vert_b = (0.25 + 0.40 * ndotl + 0.7 * spec).clip(0, 1)
-
-                fr = ((vert_r[faces[:, 0]] + vert_r[faces[:, 1]] + vert_r[faces[:, 2]]) / 3.0 * 255).astype(np.int32)
-                fg = ((vert_g[faces[:, 0]] + vert_g[faces[:, 1]] + vert_g[faces[:, 2]]) / 3.0 * 255).astype(np.int32)
-                fb = ((vert_b[faces[:, 0]] + vert_b[faces[:, 1]] + vert_b[faces[:, 2]]) / 3.0 * 255).astype(np.int32)
-                hex_colors = (fr << 16) | (fg << 8) | fb
-
+                rot_normals = rotate_normals(normals, cam_angle, cam_tilt)
                 screen_verts = transform_verts(verts, cam_angle, cam_tilt)
-                sv = screen_verts.copy()
-                sv[:, 0] /= RES
-                sv[:, 1] /= RES
 
+                # Sort back-to-front
                 face_z = (screen_verts[faces[:, 0], 2] +
                           screen_verts[faces[:, 1], 2] +
                           screen_verts[faces[:, 2], 2]) / 3.0
                 order = np.argsort(face_z)
+                faces_sorted = faces[order]
 
-                gui.triangles(sv[faces[order, 0], :2],
-                              sv[faces[order, 1], :2],
-                              sv[faces[order, 2], :2],
-                              color=hex_colors[order])
+                n_tris = min(len(faces_sorted), MAX_TRIS)
+                f = faces_sorted[:n_tris]
+                tri_v0.from_numpy(screen_verts[f[:, 0]].astype(np.float32))
+                tri_v1.from_numpy(screen_verts[f[:, 1]].astype(np.float32))
+                tri_v2.from_numpy(screen_verts[f[:, 2]].astype(np.float32))
+                tri_n0.from_numpy(rot_normals[f[:, 0]])
+                tri_n1.from_numpy(rot_normals[f[:, 1]])
+                tri_n2.from_numpy(rot_normals[f[:, 2]])
+
+                rasterize_batch(0, n_tris)
         except (ValueError, IndexError):
             pass
+        gui.set_image(framebuf)
         gui.show()
         frame += 1
 
