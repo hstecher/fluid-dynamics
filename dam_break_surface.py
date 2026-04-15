@@ -94,7 +94,7 @@ NUM_TOTAL = NUM_FLUID + NUM_BOUNDARY
 print(f"H = {H:.4f}, REST_DENSITY = {REST_DENSITY:.2f}")
 print(f"Fluid: {NUM_FLUID}, Boundary: {NUM_BOUNDARY}, Total: {NUM_TOTAL}")
 
-ti.init(arch=ti.gpu)
+ti.init(arch=ti.vulkan)
 
 # All particles in one array: [0..NUM_FLUID) are fluid, [NUM_FLUID..NUM_TOTAL) are boundary
 pos = ti.Vector.field(3, dtype=ti.f32, shape=NUM_TOTAL)
@@ -276,44 +276,24 @@ def splat_density():
 
 
 # ============================================================
-# Rendering fields (declared before MC so MC can write directly)
+# Rendering fields — GGUI handles camera/rasterization,
+# MC outputs world-space vertices/normals into mesh buffers
 # ============================================================
 
-LIGHT_DIR = np.array([0.4, 0.7, 0.5])
-LIGHT_DIR = LIGHT_DIR / np.linalg.norm(LIGHT_DIR)
-VIEW_DIR = np.array([0.0, 0.0, 1.0])
-
 RES = 700
-
-HALF_VEC = LIGHT_DIR + VIEW_DIR
-HALF_VEC = HALF_VEC / np.linalg.norm(HALF_VEC)
 
 MOUSE_RADIUS = 0.2
 MOUSE_STRENGTH = 3.0
 
 mouse_pos = ti.Vector.field(3, dtype=ti.f32, shape=())
 
-framebuf = ti.Vector.field(3, dtype=ti.f32, shape=(RES, RES))
-zbuf = ti.field(dtype=ti.i32, shape=(RES, RES))
-
-# Screen-space triangle data — written by MC kernel, read by rasterizer
+# World-space triangle data from marching cubes
 MAX_MC_TRIS = 200000
+MAX_MC_VERTS = MAX_MC_TRIS * 3
 mc_tri_count = ti.field(dtype=ti.i32, shape=())
-tri_v0 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_MC_TRIS)
-tri_v1 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_MC_TRIS)
-tri_v2 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_MC_TRIS)
-tri_n0 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_MC_TRIS)
-tri_n1 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_MC_TRIS)
-tri_n2 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_MC_TRIS)
-
-ti_light_dir = ti.Vector([float(LIGHT_DIR[0]), float(LIGHT_DIR[1]), float(LIGHT_DIR[2])])
-ti_half_vec = ti.Vector([float(HALF_VEC[0]), float(HALF_VEC[1]), float(HALF_VEC[2])])
-
-# Camera trig values — set from Python each frame, read by MC kernel
-cam_cos_a = ti.field(dtype=ti.f32, shape=())
-cam_sin_a = ti.field(dtype=ti.f32, shape=())
-cam_cos_t = ti.field(dtype=ti.f32, shape=())
-cam_sin_t = ti.field(dtype=ti.f32, shape=())
+mc_vertices = ti.Vector.field(3, dtype=ti.f32, shape=MAX_MC_VERTS)
+mc_normals = ti.Vector.field(3, dtype=ti.f32, shape=MAX_MC_VERTS)
+mc_indices = ti.field(dtype=ti.i32, shape=MAX_MC_VERTS)
 
 
 # ============================================================
@@ -625,47 +605,6 @@ mc_edge_table.from_numpy(np.array(_EDGE_TABLE, dtype=np.int32))
 mc_tri_table = ti.field(dtype=ti.i32, shape=(256, 16))
 mc_tri_table.from_numpy(np.array(_TRI_TABLE, dtype=np.int32))
 
-# Output triangle counter for marching cubes
-MAX_MC_TRIS = 200000
-mc_tri_count = ti.field(dtype=ti.i32, shape=())
-
-
-@ti.func
-def transform_point(p: ti.template()) -> ti.template():
-    """Transform world-space point to screen-space."""
-    cos_a = cam_cos_a[None]
-    sin_a = cam_sin_a[None]
-    cos_t = cam_cos_t[None]
-    sin_t = cam_sin_t[None]
-    vx = p.x - 0.5
-    vy = p.y - 0.5
-    vz = p.z - 0.5
-    x_rot = vx * cos_a + vz * sin_a
-    z_rot = -vx * sin_a + vz * cos_a
-    y_proj = vy * cos_t - z_rot * sin_t
-    z_proj = vy * sin_t + z_rot * cos_t
-    scale = 0.85
-    sx = (x_rot * scale + 0.5) * RES
-    sy = (y_proj * scale + 0.5) * RES
-    return ti.Vector([sx, sy, z_proj])
-
-
-@ti.func
-def rotate_normal(n: ti.template()) -> ti.template():
-    """Rotate normal by camera angles."""
-    cos_a = cam_cos_a[None]
-    sin_a = cam_sin_a[None]
-    cos_t = cam_cos_t[None]
-    sin_t = cam_sin_t[None]
-    nx = n.x * cos_a + n.z * sin_a
-    nz = -n.x * sin_a + n.z * cos_a
-    ny_r = n.y * cos_t - nz * sin_t
-    nz_r = n.y * sin_t + nz * cos_t
-    result = ti.Vector([nx, ny_r, nz_r])
-    length = result.norm()
-    if length > 1e-8:
-        result = result / length
-    return result
 
 
 @ti.func
@@ -919,81 +858,18 @@ def gpu_marching_cubes(iso: ti.f32):
 
                 tri_idx = ti.atomic_add(mc_tri_count[None], 1)
                 if tri_idx < MAX_MC_TRIS:
-                    # Inline transform: world -> screen space
-                    tri_v0[tri_idx] = transform_point(tv0)
-                    tri_v1[tri_idx] = transform_point(tv1)
-                    tri_v2[tri_idx] = transform_point(tv2)
-                    tri_n0[tri_idx] = rotate_normal(tn0)
-                    tri_n1[tri_idx] = rotate_normal(tn1)
-                    tri_n2[tri_idx] = rotate_normal(tn2)
+                    vi = tri_idx * 3
+                    mc_vertices[vi] = tv0
+                    mc_vertices[vi + 1] = tv1
+                    mc_vertices[vi + 2] = tv2
+                    mc_normals[vi] = tn0
+                    mc_normals[vi + 1] = tn1
+                    mc_normals[vi + 2] = tn2
+                    mc_indices[vi] = vi
+                    mc_indices[vi + 1] = vi + 1
+                    mc_indices[vi + 2] = vi + 2
 
                 k += 3
-
-
-# ============================================================
-# Rasterization kernels
-# ============================================================
-
-@ti.func
-def shade_normal(n: ti.template()) -> ti.template():
-    nn = n.normalized()
-    ndotl = ti.max(nn.dot(ti_light_dir), 0.0)
-    ndoth = ti.max(nn.dot(ti_half_vec), 0.0)
-    spec = ndoth ** 40
-    r = ti.math.clamp(0.05 + 0.15 * ndotl + 0.6 * spec, 0.0, 1.0)
-    g = ti.math.clamp(0.12 + 0.25 * ndotl + 0.6 * spec, 0.0, 1.0)
-    b = ti.math.clamp(0.25 + 0.40 * ndotl + 0.7 * spec, 0.0, 1.0)
-    return ti.Vector([r, g, b])
-
-
-@ti.func
-def edge_func(a: ti.template(), b: ti.template(), c: ti.template()) -> ti.f32:
-    return (c.x - a.x) * (b.y - a.y) - (c.y - a.y) * (b.x - a.x)
-
-
-@ti.kernel
-def clear_framebuf():
-    for i, j in framebuf:
-        framebuf[i, j] = ti.Vector([0.78, 0.78, 0.78])
-        zbuf[i, j] = -2147483647
-
-
-@ti.kernel
-def rasterize_tris(n_tris: ti.i32):
-    """Rasterize triangles with per-pixel shading and atomic Z-buffer."""
-    for t in range(n_tris):
-        v0 = tri_v0[t]
-        v1 = tri_v1[t]
-        v2 = tri_v2[t]
-        n0 = tri_n0[t]
-        n1 = tri_n1[t]
-        n2 = tri_n2[t]
-
-        min_x = ti.max(int(ti.floor(ti.min(v0.x, ti.min(v1.x, v2.x)))), 0)
-        max_x = ti.min(int(ti.ceil(ti.max(v0.x, ti.max(v1.x, v2.x)))), RES - 1)
-        min_y = ti.max(int(ti.floor(ti.min(v0.y, ti.min(v1.y, v2.y)))), 0)
-        max_y = ti.min(int(ti.ceil(ti.max(v0.y, ti.max(v1.y, v2.y)))), RES - 1)
-
-        area = edge_func(v0, v1, v2)
-        if ti.abs(area) > 1.0:
-            if area < 0.0:
-                v0, v1 = v1, v0
-                n0, n1 = n1, n0
-                area = -area
-            inv_area = 1.0 / area
-            for px in range(min_x, max_x + 1):
-                for py in range(min_y, max_y + 1):
-                    p = ti.Vector([float(px) + 0.5, float(py) + 0.5, 0.0])
-                    w0 = edge_func(v1, v2, p) * inv_area
-                    w1 = edge_func(v2, v0, p) * inv_area
-                    w2 = 1.0 - w0 - w1
-                    if w0 >= 0.0 and w1 >= 0.0 and w2 >= 0.0:
-                        z = w0 * v0.z + w1 * v1.z + w2 * v2.z
-                        z_int = int(z * 1e6)
-                        old = ti.atomic_max(zbuf[px, py], z_int)
-                        if z_int >= old:
-                            interp_n = w0 * n0 + w1 * n1 + w2 * n2
-                            framebuf[px, py] = shade_normal(interp_n)
 
 
 @ti.kernel
@@ -1005,21 +881,6 @@ def apply_mouse_force():
         if dist < MOUSE_RADIUS and dist > EPSILON:
             strength = MOUSE_STRENGTH * (1.0 - dist / MOUSE_RADIUS)
             vel[i] += strength * r / dist
-
-
-def screen_to_world(sx, sy, cam_angle, cam_tilt):
-    """Unproject screen coords [0,1] back to world space."""
-    cos_a = math.cos(cam_angle)
-    sin_a = math.sin(cam_angle)
-    cos_t = math.cos(cam_tilt)
-    sin_t = math.sin(cam_tilt)
-    scale = 0.85
-    x_rot = (sx - 0.5) / scale
-    y_proj = (sy - 0.5) / scale
-    vx = x_rot * cos_a
-    vz = x_rot * sin_a
-    vy = y_proj / cos_t if abs(cos_t) > 0.01 else 0.0
-    return np.array([vx + 0.5, vy + 0.5, vz + 0.5])
 
 
 def initialize():
@@ -1051,43 +912,31 @@ def initialize():
 def main():
     initialize()
 
-    gui = ti.GUI("PBD Dam Break + GPU Surface", res=(RES, RES),
-                 background_color=0xC7C7C7)
+    window = ti.ui.Window("PBD Dam Break + GPU Surface", (RES, RES))
+    canvas = window.get_canvas()
+    scene = window.get_scene()
+    camera = ti.ui.Camera()
+    camera.position(1.2, 1.0, 1.2)
+    camera.lookat(0.5, 0.35, 0.5)
+    camera.up(0.0, 1.0, 0.0)
+    camera.fov(45)
 
     paused = False
-    frame = 0
     iso_threshold = REST_DENSITY * 0.4
-    cam_angle = 0.75
-    cam_tilt = 0.35
-    rot_speed = 0.05
 
     print(f"Iso threshold = {iso_threshold:.2f}")
-    print("Controls: Arrows=rotate, Space=pause, R=reset, LMB=push water, Esc=quit")
+    print("Controls: Space=pause, R=reset, WASD/mouse=camera, Esc=quit")
 
-    while gui.running:
-        for e in gui.get_events(gui.PRESS):
-            if e.key == gui.ESCAPE:
-                gui.running = False
+    while window.running:
+        for e in window.get_events(ti.ui.PRESS):
+            if e.key == ti.ui.ESCAPE:
+                window.running = False
             elif e.key == ' ':
                 paused = not paused
             elif e.key == 'r':
                 initialize()
 
-        if gui.is_pressed(gui.LEFT):
-            cam_angle -= rot_speed
-        if gui.is_pressed(gui.RIGHT):
-            cam_angle += rot_speed
-        if gui.is_pressed(gui.UP):
-            cam_tilt = min(cam_tilt + rot_speed, 1.2)
-        if gui.is_pressed(gui.DOWN):
-            cam_tilt = max(cam_tilt - rot_speed, -0.2)
-
-        if gui.is_pressed(gui.LMB):
-            mx, my = gui.get_cursor_pos()
-            wp = screen_to_world(mx, my, cam_angle, cam_tilt)
-            wp = np.clip(wp, 0.0, 1.0)
-            mouse_pos[None] = ti.Vector([float(wp[0]), float(wp[1]), float(wp[2])])
-            apply_mouse_force()
+        camera.track_user_inputs(window, movement_speed=0.03, hold_key=ti.ui.RMB)
 
         if not paused:
             for _ in range(SUB_STEPS):
@@ -1100,24 +949,29 @@ def main():
                     enforce_boundary()
                 update_velocity()
 
-        # Set camera trig values for GPU kernels
-        cam_cos_a[None] = math.cos(cam_angle)
-        cam_sin_a[None] = math.sin(cam_angle)
-        cam_cos_t[None] = math.cos(cam_tilt)
-        cam_sin_t[None] = math.sin(cam_tilt)
-
-        # Full GPU pipeline: splat -> MC (with inline transform) -> rasterize
-        clear_framebuf()
+        # GPU pipeline: splat density -> marching cubes
         splat_density()
         reset_mc_counter()
         gpu_marching_cubes(iso_threshold)
         n_tris = mc_tri_count[None]
-        if n_tris > 0:
-            rasterize_tris(min(n_tris, MAX_MC_TRIS))
+        n_verts = min(n_tris, MAX_MC_TRIS) * 3
 
-        gui.set_image(framebuf)
-        gui.show()
-        frame += 1
+        # Render with GGUI
+        scene.set_camera(camera)
+        scene.ambient_light((0.3, 0.3, 0.3))
+        scene.point_light(pos=(2.0, 2.0, 2.0), color=(0.9, 0.9, 0.9))
+        scene.point_light(pos=(-1.0, 1.5, 0.0), color=(0.3, 0.3, 0.4))
+
+        if n_verts > 0:
+            scene.mesh(mc_vertices,
+                       indices=mc_indices,
+                       normals=mc_normals,
+                       vertex_count=n_verts,
+                       index_count=n_verts,
+                       color=(0.15, 0.35, 0.65))
+
+        canvas.scene(scene)
+        window.show()
 
 
 if __name__ == "__main__":
