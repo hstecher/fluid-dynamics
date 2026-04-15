@@ -12,7 +12,7 @@ import math
 from skimage.measure import marching_cubes
 
 # --- Simulation parameters ---
-NUM_FLUID = 4000
+NUM_FLUID = 6000
 DT = 1.0 / 60.0
 SUB_STEPS = 3
 SOLVER_ITERS = 3
@@ -38,7 +38,7 @@ GRID_DIM = int(np.ceil((DOMAIN_MAX - DOMAIN_MIN) / GRID_SIZE)) + 1
 MAX_NEIGHBORS = 96
 MAX_PER_CELL = 96
 
-MC_RES = 50
+MC_RES = 60
 MC_CELL = (DOMAIN_MAX - DOMAIN_MIN) / MC_RES
 MC_SPLAT_RADIUS = H
 
@@ -279,11 +279,11 @@ def initialize():
     spacing = PARTICLE_DIAMETER
     positions = []
     x = 0.05
-    while x < 0.45 and len(positions) < NUM_FLUID:
+    while x < 0.55 and len(positions) < NUM_FLUID:
         y = 0.05
         while y < 0.85 and len(positions) < NUM_FLUID:
             z = 0.05
-            while z < 0.45 and len(positions) < NUM_FLUID:
+            while z < 0.55 and len(positions) < NUM_FLUID:
                 positions.append([x, y, z])
                 z += spacing
             y += spacing
@@ -321,7 +321,7 @@ mouse_pos = ti.Vector.field(3, dtype=ti.f32, shape=())
 framebuf = ti.Vector.field(3, dtype=ti.f32, shape=(RES, RES))
 
 # Triangle data
-MAX_TRIS = 30000
+MAX_TRIS = 50000
 tri_v0 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIS)
 tri_v1 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIS)
 tri_v2 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIS)
