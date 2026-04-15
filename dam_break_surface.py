@@ -295,6 +295,24 @@ mc_vertices = ti.Vector.field(3, dtype=ti.f32, shape=MAX_MC_VERTS)
 mc_normals = ti.Vector.field(3, dtype=ti.f32, shape=MAX_MC_VERTS)
 mc_indices = ti.field(dtype=ti.i32, shape=MAX_MC_VERTS)
 
+# Render fields — sized to typical MC output, not worst-case MAX_MC_VERTS.
+# scene.mesh() copies ALL vertices in the field to a numpy VBO every frame,
+# regardless of vertex_count. Using right-sized fields avoids copying 600K
+# unused vertices. GPU-side copy into these is ~10x faster overall.
+RENDER_MAX_VERTS = 60000
+render_vertices = ti.Vector.field(3, dtype=ti.f32, shape=RENDER_MAX_VERTS)
+render_normals = ti.Vector.field(3, dtype=ti.f32, shape=RENDER_MAX_VERTS)
+render_indices = ti.field(dtype=ti.i32, shape=RENDER_MAX_VERTS)
+
+
+@ti.kernel
+def copy_mc_to_render(n_verts: ti.i32):
+    """GPU-side copy of active MC vertices into the smaller render fields."""
+    for i in range(n_verts):
+        render_vertices[i] = mc_vertices[i]
+        render_normals[i] = mc_normals[i]
+        render_indices[i] = mc_indices[i]
+
 
 # ============================================================
 # GPU Marching Cubes — full Taichi implementation
@@ -961,12 +979,13 @@ def main():
         scene.point_light(pos=(-1.0, 1.5, 0.0), color=(0.3, 0.3, 0.4))
 
         n_tris = mc_tri_count[None]
-        n_verts = min(n_tris, MAX_MC_TRIS) * 3
+        n_verts = min(min(n_tris, MAX_MC_TRIS) * 3, RENDER_MAX_VERTS)
 
         if n_verts > 0:
-            scene.mesh(mc_vertices,
-                       indices=mc_indices,
-                       normals=mc_normals,
+            copy_mc_to_render(n_verts)
+            scene.mesh(render_vertices,
+                       indices=render_indices,
+                       normals=render_normals,
                        vertex_count=n_verts,
                        index_count=n_verts,
                        color=(0.15, 0.35, 0.65))
