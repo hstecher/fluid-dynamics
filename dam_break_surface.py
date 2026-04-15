@@ -94,7 +94,11 @@ NUM_TOTAL = NUM_FLUID + NUM_BOUNDARY
 print(f"H = {H:.4f}, REST_DENSITY = {REST_DENSITY:.2f}")
 print(f"Fluid: {NUM_FLUID}, Boundary: {NUM_BOUNDARY}, Total: {NUM_TOTAL}")
 
-ti.init(arch=ti.vulkan)
+import platform as _platform
+# Use CUDA on NVIDIA (fast compute) — GGUI handles Vulkan rendering via interop.
+# Use Vulkan on Mac (Metal has no GGUI support; MoltenVK translates Vulkan).
+_arch = ti.cuda if _platform.system() != "Darwin" else ti.vulkan
+ti.init(arch=_arch)
 
 # All particles in one array: [0..NUM_FLUID) are fluid, [NUM_FLUID..NUM_TOTAL) are boundary
 pos = ti.Vector.field(3, dtype=ti.f32, shape=NUM_TOTAL)
@@ -210,7 +214,7 @@ def compute_lambdas():
 
 
 @ti.kernel
-def apply_corrections():
+def apply_corrections_and_clamp():
     for i in range(NUM_FLUID):
         dp = ti.Vector([0.0, 0.0, 0.0])
         for k in range(neighbor_count[i]):
@@ -224,17 +228,13 @@ def apply_corrections():
             dp += (lambdas[i] + lam_j) * spiky_gradient(r, r_len)
         delta_pos[i] = (MASS / REST_DENSITY) * dp
     for i in range(NUM_FLUID):
-        pos_pred[i] += delta_pos[i]
-
-
-@ti.kernel
-def enforce_boundary():
-    for i in range(NUM_FLUID):
+        p = pos_pred[i] + delta_pos[i]
         for d in ti.static(range(3)):
-            if pos_pred[i][d] < DOMAIN_MIN + BOUNDARY_EPS:
-                pos_pred[i][d] = DOMAIN_MIN + BOUNDARY_EPS
-            if pos_pred[i][d] > DOMAIN_MAX - BOUNDARY_EPS:
-                pos_pred[i][d] = DOMAIN_MAX - BOUNDARY_EPS
+            if p[d] < DOMAIN_MIN + BOUNDARY_EPS:
+                p[d] = DOMAIN_MIN + BOUNDARY_EPS
+            if p[d] > DOMAIN_MAX - BOUNDARY_EPS:
+                p[d] = DOMAIN_MAX - BOUNDARY_EPS
+        pos_pred[i] = p
 
 
 @ti.kernel
@@ -945,22 +945,23 @@ def main():
                 find_neighbors()
                 for _ in range(SOLVER_ITERS):
                     compute_lambdas()
-                    apply_corrections()
-                    enforce_boundary()
+                    apply_corrections_and_clamp()
                 update_velocity()
 
         # GPU pipeline: splat density -> marching cubes
         splat_density()
         reset_mc_counter()
         gpu_marching_cubes(iso_threshold)
-        n_tris = mc_tri_count[None]
-        n_verts = min(n_tris, MAX_MC_TRIS) * 3
 
         # Render with GGUI
+        # Set up scene first to give GPU time to finish MC before we read the count
         scene.set_camera(camera)
         scene.ambient_light((0.3, 0.3, 0.3))
         scene.point_light(pos=(2.0, 2.0, 2.0), color=(0.9, 0.9, 0.9))
         scene.point_light(pos=(-1.0, 1.5, 0.0), color=(0.3, 0.3, 0.4))
+
+        n_tris = mc_tri_count[None]
+        n_verts = min(n_tris, MAX_MC_TRIS) * 3
 
         if n_verts > 0:
             scene.mesh(mc_vertices,
