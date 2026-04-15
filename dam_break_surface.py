@@ -356,7 +356,7 @@ zbuf = ti.field(dtype=ti.i32, shape=(RES, RES))  # integer Z for atomic_max
 @ti.kernel
 def clear_framebuf():
     for i, j in framebuf:
-        framebuf[i, j] = ti.Vector([0.05, 0.05, 0.08])
+        framebuf[i, j] = ti.Vector([0.78, 0.78, 0.78])
         zbuf[i, j] = -2147483647
 
 
@@ -493,7 +493,7 @@ def main():
     initialize()
 
     gui = ti.GUI("PBD Dam Break + Shaded Surface", res=(RES, RES),
-                 background_color=0x0D0D14)
+                 background_color=0xC7C7C7)
 
     paused = False
     frame = 0
