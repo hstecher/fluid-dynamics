@@ -286,8 +286,8 @@ def splat_density():
 
 RES = 700
 
-MOUSE_RADIUS = 0.2
-MOUSE_STRENGTH = 3.0
+MOUSE_RADIUS = 0.3
+MOUSE_STRENGTH = 25.0
 
 mouse_pos = ti.Vector.field(3, dtype=ti.f32, shape=())
 
@@ -954,8 +954,14 @@ def main():
     paused = False
     iso_threshold = REST_DENSITY * 0.4
 
+    # Camera state — managed manually so orbit/pan stay consistent
+    cam_lookat = [0.5, 0.35, 0.5]
+    cam_dist = 1.5
+    cam_theta = math.atan2(1.2 - 0.5, 1.2 - 0.5)  # horizontal angle
+    cam_phi = math.atan2(1.0 - 0.35, math.sqrt((1.2-0.5)**2 + (1.2-0.5)**2))  # vertical angle
+
     print(f"Iso threshold = {iso_threshold:.2f}")
-    print("Controls: Space=pause, R=reset, WASD/mouse=camera, Esc=quit")
+    print("Controls: Space=pause, R=reset, Arrows=orbit, Shift+Arrows=pan, W/S=zoom, LMB=push fluid, Esc=quit")
 
     while window.running:
         for e in window.get_events(ti.ui.PRESS):
@@ -966,7 +972,54 @@ def main():
             elif e.key == 'r':
                 initialize()
 
-        camera.track_user_inputs(window, movement_speed=0.03, hold_key=ti.ui.RMB)
+        # Camera controls — all state in cam_lookat/cam_theta/cam_phi/cam_dist
+        orbit_speed = 0.02
+        pan_speed = 0.015
+        panning = window.is_pressed(ti.ui.SHIFT)
+
+        if panning:
+            # Shift+Arrows: pan lookat point relative to camera orientation
+            # Right vector (perpendicular to view direction, in XZ plane)
+            rx = -math.sin(cam_theta)
+            rz = math.cos(cam_theta)
+            # Forward vector (toward camera, projected onto XZ plane)
+            fwd_x = -math.cos(cam_theta)
+            fwd_z = -math.sin(cam_theta)
+            if window.is_pressed(ti.ui.LEFT):
+                cam_lookat[0] += rx * pan_speed
+                cam_lookat[2] += rz * pan_speed
+            if window.is_pressed(ti.ui.RIGHT):
+                cam_lookat[0] -= rx * pan_speed
+                cam_lookat[2] -= rz * pan_speed
+            if window.is_pressed(ti.ui.UP):
+                cam_lookat[0] += fwd_x * pan_speed
+                cam_lookat[2] += fwd_z * pan_speed
+            if window.is_pressed(ti.ui.DOWN):
+                cam_lookat[0] -= fwd_x * pan_speed
+                cam_lookat[2] -= fwd_z * pan_speed
+        else:
+            # Arrows: orbit
+            if window.is_pressed(ti.ui.LEFT):
+                cam_theta += orbit_speed
+            if window.is_pressed(ti.ui.RIGHT):
+                cam_theta -= orbit_speed
+            if window.is_pressed(ti.ui.UP):
+                cam_phi = min(cam_phi + orbit_speed, math.pi/2 - 0.05)
+            if window.is_pressed(ti.ui.DOWN):
+                cam_phi = max(cam_phi - orbit_speed, -math.pi/2 + 0.05)
+
+        # WASD: zoom in/out and horizontal orbit
+        if window.is_pressed('w'):
+            cam_dist = max(0.3, cam_dist - 0.02)
+        if window.is_pressed('s'):
+            cam_dist = min(5.0, cam_dist + 0.02)
+
+        # Apply camera state
+        cx = cam_lookat[0] + cam_dist * math.cos(cam_phi) * math.cos(cam_theta)
+        cy = cam_lookat[1] + cam_dist * math.sin(cam_phi)
+        cz = cam_lookat[2] + cam_dist * math.cos(cam_phi) * math.sin(cam_theta)
+        camera.position(cx, cy, cz)
+        camera.lookat(cam_lookat[0], cam_lookat[1], cam_lookat[2])
 
         if not paused:
             for _ in range(SUB_STEPS):
@@ -977,6 +1030,41 @@ def main():
                     compute_lambdas()
                     apply_corrections_and_clamp()
                 update_velocity()
+
+        # Mouse interaction: left-click pushes fluid away
+        # Applied after sim so vel isn't overwritten by PBD solver
+        if window.is_pressed(ti.ui.LMB):
+            cursor = window.get_cursor_pos()
+            cp = camera.curr_position
+            cl = camera.curr_lookat
+            cu = camera.curr_up
+            fx, fy, fz = cl[0]-cp[0], cl[1]-cp[1], cl[2]-cp[2]
+            fl = math.sqrt(fx*fx + fy*fy + fz*fz)
+            fx, fy, fz = fx/fl, fy/fl, fz/fl
+            rx = fy*cu[2] - fz*cu[1]
+            ry = fz*cu[0] - fx*cu[2]
+            rz = fx*cu[1] - fy*cu[0]
+            rl = math.sqrt(rx*rx + ry*ry + rz*rz)
+            if rl > 1e-8:
+                rx, ry, rz = rx/rl, ry/rl, rz/rl
+                ux = ry*fz - rz*fy
+                uy = rz*fx - rx*fz
+                uz = rx*fy - ry*fx
+                half_t = math.tan(45.0 * math.pi / 360.0)
+                cx = (cursor[0] - 0.5) * 2.0 * half_t
+                cy = (cursor[1] - 0.5) * 2.0 * half_t
+                dx = fx + cx*rx + cy*ux
+                dy = fy + cx*ry + cy*uy
+                dz = fz + cx*rz + cy*uz
+                dl = math.sqrt(dx*dx + dy*dy + dz*dz)
+                dx, dy, dz = dx/dl, dy/dl, dz/dl
+                if abs(dy) > 1e-6:
+                    t = (0.35 - cp[1]) / dy
+                    if t > 0:
+                        hx = max(DOMAIN_MIN, min(DOMAIN_MAX, cp[0] + t*dx))
+                        hz = max(DOMAIN_MIN, min(DOMAIN_MAX, cp[2] + t*dz))
+                        mouse_pos[None] = [hx, 0.35, hz]
+                        apply_mouse_force()
 
         # GPU pipeline: clear -> splat density -> marching cubes
         clear_density()
