@@ -276,6 +276,47 @@ def splat_density():
 
 
 # ============================================================
+# Rendering fields (declared before MC so MC can write directly)
+# ============================================================
+
+LIGHT_DIR = np.array([0.4, 0.7, 0.5])
+LIGHT_DIR = LIGHT_DIR / np.linalg.norm(LIGHT_DIR)
+VIEW_DIR = np.array([0.0, 0.0, 1.0])
+
+RES = 700
+
+HALF_VEC = LIGHT_DIR + VIEW_DIR
+HALF_VEC = HALF_VEC / np.linalg.norm(HALF_VEC)
+
+MOUSE_RADIUS = 0.2
+MOUSE_STRENGTH = 3.0
+
+mouse_pos = ti.Vector.field(3, dtype=ti.f32, shape=())
+
+framebuf = ti.Vector.field(3, dtype=ti.f32, shape=(RES, RES))
+zbuf = ti.field(dtype=ti.i32, shape=(RES, RES))
+
+# Screen-space triangle data — written by MC kernel, read by rasterizer
+MAX_MC_TRIS = 200000
+mc_tri_count = ti.field(dtype=ti.i32, shape=())
+tri_v0 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_MC_TRIS)
+tri_v1 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_MC_TRIS)
+tri_v2 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_MC_TRIS)
+tri_n0 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_MC_TRIS)
+tri_n1 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_MC_TRIS)
+tri_n2 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_MC_TRIS)
+
+ti_light_dir = ti.Vector([float(LIGHT_DIR[0]), float(LIGHT_DIR[1]), float(LIGHT_DIR[2])])
+ti_half_vec = ti.Vector([float(HALF_VEC[0]), float(HALF_VEC[1]), float(HALF_VEC[2])])
+
+# Camera trig values — set from Python each frame, read by MC kernel
+cam_cos_a = ti.field(dtype=ti.f32, shape=())
+cam_sin_a = ti.field(dtype=ti.f32, shape=())
+cam_cos_t = ti.field(dtype=ti.f32, shape=())
+cam_sin_t = ti.field(dtype=ti.f32, shape=())
+
+
+# ============================================================
 # GPU Marching Cubes — full Taichi implementation
 # ============================================================
 
@@ -584,14 +625,47 @@ mc_edge_table.from_numpy(np.array(_EDGE_TABLE, dtype=np.int32))
 mc_tri_table = ti.field(dtype=ti.i32, shape=(256, 16))
 mc_tri_table.from_numpy(np.array(_TRI_TABLE, dtype=np.int32))
 
-# Output triangle buffers for marching cubes
-# Each cell can produce up to 5 triangles. Total cells = MC_RES^3.
-# We use an atomic counter and a flat buffer.
+# Output triangle counter for marching cubes
 MAX_MC_TRIS = 200000
 mc_tri_count = ti.field(dtype=ti.i32, shape=())
-# Each triangle: 3 vertices + 3 normals (stored as world-space positions, normals computed from gradient)
-mc_verts = ti.Vector.field(3, dtype=ti.f32, shape=(MAX_MC_TRIS, 3))  # [tri_idx, vert_idx]
-mc_normals = ti.Vector.field(3, dtype=ti.f32, shape=(MAX_MC_TRIS, 3))
+
+
+@ti.func
+def transform_point(p: ti.template()) -> ti.template():
+    """Transform world-space point to screen-space."""
+    cos_a = cam_cos_a[None]
+    sin_a = cam_sin_a[None]
+    cos_t = cam_cos_t[None]
+    sin_t = cam_sin_t[None]
+    vx = p.x - 0.5
+    vy = p.y - 0.5
+    vz = p.z - 0.5
+    x_rot = vx * cos_a + vz * sin_a
+    z_rot = -vx * sin_a + vz * cos_a
+    y_proj = vy * cos_t - z_rot * sin_t
+    z_proj = vy * sin_t + z_rot * cos_t
+    scale = 0.85
+    sx = (x_rot * scale + 0.5) * RES
+    sy = (y_proj * scale + 0.5) * RES
+    return ti.Vector([sx, sy, z_proj])
+
+
+@ti.func
+def rotate_normal(n: ti.template()) -> ti.template():
+    """Rotate normal by camera angles."""
+    cos_a = cam_cos_a[None]
+    sin_a = cam_sin_a[None]
+    cos_t = cam_cos_t[None]
+    sin_t = cam_sin_t[None]
+    nx = n.x * cos_a + n.z * sin_a
+    nz = -n.x * sin_a + n.z * cos_a
+    ny_r = n.y * cos_t - nz * sin_t
+    nz_r = n.y * sin_t + nz * cos_t
+    result = ti.Vector([nx, ny_r, nz_r])
+    length = result.norm()
+    if length > 1e-8:
+        result = result / length
+    return result
 
 
 @ti.func
@@ -845,56 +919,20 @@ def gpu_marching_cubes(iso: ti.f32):
 
                 tri_idx = ti.atomic_add(mc_tri_count[None], 1)
                 if tri_idx < MAX_MC_TRIS:
-                    mc_verts[tri_idx, 0] = tv0
-                    mc_verts[tri_idx, 1] = tv1
-                    mc_verts[tri_idx, 2] = tv2
-                    mc_normals[tri_idx, 0] = tn0
-                    mc_normals[tri_idx, 1] = tn1
-                    mc_normals[tri_idx, 2] = tn2
+                    # Inline transform: world -> screen space
+                    tri_v0[tri_idx] = transform_point(tv0)
+                    tri_v1[tri_idx] = transform_point(tv1)
+                    tri_v2[tri_idx] = transform_point(tv2)
+                    tri_n0[tri_idx] = rotate_normal(tn0)
+                    tri_n1[tri_idx] = rotate_normal(tn1)
+                    tri_n2[tri_idx] = rotate_normal(tn2)
 
                 k += 3
 
 
 # ============================================================
-# GPU vertex transform + rasterization (no CPU sorting needed)
+# Rasterization kernels
 # ============================================================
-
-LIGHT_DIR = np.array([0.4, 0.7, 0.5])
-LIGHT_DIR = LIGHT_DIR / np.linalg.norm(LIGHT_DIR)
-VIEW_DIR = np.array([0.0, 0.0, 1.0])
-
-RES = 700
-
-HALF_VEC = LIGHT_DIR + VIEW_DIR
-HALF_VEC = HALF_VEC / np.linalg.norm(HALF_VEC)
-
-# Mouse interaction force
-MOUSE_RADIUS = 0.2
-MOUSE_STRENGTH = 3.0
-
-mouse_pos = ti.Vector.field(3, dtype=ti.f32, shape=())
-
-# Framebuffer for smooth-shaded software rasterizer
-framebuf = ti.Vector.field(3, dtype=ti.f32, shape=(RES, RES))
-
-# Triangle data for rasterizer (screen space)
-MAX_TRIS = 200000
-tri_v0 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIS)
-tri_v1 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIS)
-tri_v2 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIS)
-tri_n0 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIS)
-tri_n1 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIS)
-tri_n2 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIS)
-
-ti_light_dir = ti.Vector([float(LIGHT_DIR[0]), float(LIGHT_DIR[1]), float(LIGHT_DIR[2])])
-ti_half_vec = ti.Vector([float(HALF_VEC[0]), float(HALF_VEC[1]), float(HALF_VEC[2])])
-
-# Camera parameters as Taichi fields so transform runs on GPU
-cam_cos_a = ti.field(dtype=ti.f32, shape=())
-cam_sin_a = ti.field(dtype=ti.f32, shape=())
-cam_cos_t = ti.field(dtype=ti.f32, shape=())
-cam_sin_t = ti.field(dtype=ti.f32, shape=())
-
 
 @ti.func
 def shade_normal(n: ti.template()) -> ti.template():
@@ -913,61 +951,6 @@ def edge_func(a: ti.template(), b: ti.template(), c: ti.template()) -> ti.f32:
     return (c.x - a.x) * (b.y - a.y) - (c.y - a.y) * (b.x - a.x)
 
 
-zbuf = ti.field(dtype=ti.i32, shape=(RES, RES))
-
-
-@ti.func
-def transform_point(p: ti.template()) -> ti.template():
-    """Transform world-space point to screen-space."""
-    cos_a = cam_cos_a[None]
-    sin_a = cam_sin_a[None]
-    cos_t = cam_cos_t[None]
-    sin_t = cam_sin_t[None]
-    vx = p.x - 0.5
-    vy = p.y - 0.5
-    vz = p.z - 0.5
-    x_rot = vx * cos_a + vz * sin_a
-    z_rot = -vx * sin_a + vz * cos_a
-    y_proj = vy * cos_t - z_rot * sin_t
-    z_proj = vy * sin_t + z_rot * cos_t
-    scale = 0.85
-    sx = (x_rot * scale + 0.5) * RES
-    sy = (y_proj * scale + 0.5) * RES
-    return ti.Vector([sx, sy, z_proj])
-
-
-@ti.func
-def rotate_normal(n: ti.template()) -> ti.template():
-    """Rotate normal by camera angles."""
-    cos_a = cam_cos_a[None]
-    sin_a = cam_sin_a[None]
-    cos_t = cam_cos_t[None]
-    sin_t = cam_sin_t[None]
-    nx = n.x * cos_a + n.z * sin_a
-    nz = -n.x * sin_a + n.z * cos_a
-    ny_r = n.y * cos_t - nz * sin_t
-    nz_r = n.y * sin_t + nz * cos_t
-    result = ti.Vector([nx, ny_r, nz_r])
-    length = result.norm()
-    if length > 1e-8:
-        result = result / length
-    return result
-
-
-@ti.kernel
-def transform_and_prepare(n_tris: ti.i32):
-    """Transform MC output to screen space and prepare for rasterization. All on GPU."""
-    for t in range(n_tris):
-        # Transform vertices to screen space
-        tri_v0[t] = transform_point(mc_verts[t, 0])
-        tri_v1[t] = transform_point(mc_verts[t, 1])
-        tri_v2[t] = transform_point(mc_verts[t, 2])
-        # Rotate normals
-        tri_n0[t] = rotate_normal(mc_normals[t, 0])
-        tri_n1[t] = rotate_normal(mc_normals[t, 1])
-        tri_n2[t] = rotate_normal(mc_normals[t, 2])
-
-
 @ti.kernel
 def clear_framebuf():
     for i, j in framebuf:
@@ -976,9 +959,9 @@ def clear_framebuf():
 
 
 @ti.kernel
-def rasterize_batch(batch_start: ti.i32, batch_end: ti.i32):
-    """Rasterize triangles with per-pixel smooth shading and atomic Z-buffer."""
-    for t in range(batch_start, batch_end):
+def rasterize_tris(n_tris: ti.i32):
+    """Rasterize triangles with per-pixel shading and atomic Z-buffer."""
+    for t in range(n_tris):
         v0 = tri_v0[t]
         v1 = tri_v1[t]
         v2 = tri_v2[t]
@@ -1117,22 +1100,20 @@ def main():
                     enforce_boundary()
                 update_velocity()
 
-        # Update camera trig values for GPU transform
+        # Set camera trig values for GPU kernels
         cam_cos_a[None] = math.cos(cam_angle)
         cam_sin_a[None] = math.sin(cam_angle)
         cam_cos_t[None] = math.cos(cam_tilt)
         cam_sin_t[None] = math.sin(cam_tilt)
 
-        # Full GPU rendering pipeline: splat -> marching cubes -> transform -> rasterize
+        # Full GPU pipeline: splat -> MC (with inline transform) -> rasterize
         clear_framebuf()
         splat_density()
         reset_mc_counter()
         gpu_marching_cubes(iso_threshold)
-
-        n_tris = min(mc_tri_count[None], MAX_MC_TRIS)
+        n_tris = mc_tri_count[None]
         if n_tris > 0:
-            transform_and_prepare(n_tris)
-            rasterize_batch(0, n_tris)
+            rasterize_tris(min(n_tris, MAX_MC_TRIS))
 
         gui.set_image(framebuf)
         gui.show()
