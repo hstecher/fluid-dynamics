@@ -12,7 +12,7 @@ import numpy as np
 import math
 
 # --- Simulation parameters ---
-NUM_FLUID = 6000
+NUM_FLUID = 15000
 DT = 1.0 / 60.0
 SUB_STEPS = 3
 SOLVER_ITERS = 3
@@ -287,7 +287,7 @@ def splat_density():
 RES = 700
 
 MOUSE_RADIUS = 0.3
-MOUSE_STRENGTH = 25.0
+MOUSE_STRENGTH = 12.0
 
 mouse_pos = ti.Vector.field(3, dtype=ti.f32, shape=())
 
@@ -917,11 +917,11 @@ def initialize():
     spacing = PARTICLE_DIAMETER
     positions = []
     x = 0.05
-    while x < 0.55 and len(positions) < NUM_FLUID:
+    while x < 0.75 and len(positions) < NUM_FLUID:
         y = 0.05
-        while y < 0.85 and len(positions) < NUM_FLUID:
+        while y < 0.95 and len(positions) < NUM_FLUID:
             z = 0.05
-            while z < 0.55 and len(positions) < NUM_FLUID:
+            while z < 0.75 and len(positions) < NUM_FLUID:
                 positions.append([x, y, z])
                 z += spacing
             y += spacing
