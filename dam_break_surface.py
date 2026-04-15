@@ -1,6 +1,7 @@
 """
 PBD fluid dam break with marching cubes surface reconstruction.
 Static boundary particles along walls/corners for proper density estimation.
+Full GPU pipeline: density splat -> marching cubes -> transform -> rasterize (all Taichi).
 
 Run: python3 dam_break_surface.py
 Controls: Space=pause, R=reset, Esc=quit, P=toggle particles, W=toggle wireframe
@@ -9,7 +10,6 @@ Controls: Space=pause, R=reset, Esc=quit, P=toggle particles, W=toggle wireframe
 import taichi as ti
 import numpy as np
 import math
-from skimage.measure import marching_cubes
 
 # --- Simulation parameters ---
 NUM_FLUID = 6000
@@ -275,32 +275,589 @@ def splat_density():
                     ti.atomic_add(density_grid[gx, gy, gz], poly6_w(r_sq))
 
 
-def initialize():
-    spacing = PARTICLE_DIAMETER
-    positions = []
-    x = 0.05
-    while x < 0.55 and len(positions) < NUM_FLUID:
-        y = 0.05
-        while y < 0.85 and len(positions) < NUM_FLUID:
-            z = 0.05
-            while z < 0.55 and len(positions) < NUM_FLUID:
-                positions.append([x, y, z])
-                z += spacing
-            y += spacing
-        x += spacing
-    n = min(len(positions), NUM_FLUID)
-    fluid_pos = np.array(positions[:n], dtype=np.float32)
-    if n < NUM_FLUID:
-        extra = NUM_FLUID - n
-        pad = np.random.uniform(0.05, 0.45, (extra, 3)).astype(np.float32)
-        fluid_pos = np.vstack([fluid_pos, pad])
+# ============================================================
+# GPU Marching Cubes — full Taichi implementation
+# ============================================================
 
-    # Combine fluid + boundary into single array
-    all_pos = np.vstack([fluid_pos, BOUNDARY_POS])
-    pos.from_numpy(all_pos)
-    vel.from_numpy(np.zeros((NUM_FLUID, 3), dtype=np.float32))
-    print(f"Initialized {n} fluid + {NUM_BOUNDARY} boundary particles")
+# Standard marching cubes edge table: for each of the 256 cube configurations,
+# a 12-bit mask indicating which edges are intersected by the isosurface.
+_EDGE_TABLE = [
+    0x0, 0x109, 0x203, 0x30a, 0x406, 0x50f, 0x605, 0x70c,
+    0x80c, 0x905, 0xa0f, 0xb06, 0xc0a, 0xd03, 0xe09, 0xf00,
+    0x190, 0x99, 0x393, 0x29a, 0x596, 0x49f, 0x795, 0x69c,
+    0x99c, 0x895, 0xb9f, 0xa96, 0xd9a, 0xc93, 0xf99, 0xe90,
+    0x230, 0x339, 0x33, 0x13a, 0x636, 0x73f, 0x435, 0x53c,
+    0xa3c, 0xb35, 0x83f, 0x936, 0xe3a, 0xf33, 0xc39, 0xd30,
+    0x3a0, 0x2a9, 0x1a3, 0xaa, 0x7a6, 0x6af, 0x5a5, 0x4ac,
+    0xbac, 0xaa5, 0x9af, 0x8a6, 0xfaa, 0xea3, 0xda9, 0xca0,
+    0x460, 0x569, 0x663, 0x76a, 0x66, 0x16f, 0x265, 0x36c,
+    0xc6c, 0xd65, 0xe6f, 0xf66, 0x86a, 0x963, 0xa69, 0xb60,
+    0x5f0, 0x4f9, 0x7f3, 0x6fa, 0x1f6, 0xff, 0x3f5, 0x2fc,
+    0xdfc, 0xcf5, 0xfff, 0xef6, 0x9fa, 0x8f3, 0xbf9, 0xaf0,
+    0x650, 0x759, 0x453, 0x55a, 0x256, 0x35f, 0x55, 0x15c,
+    0xe5c, 0xf55, 0xc5f, 0xd56, 0xa5a, 0xb53, 0x859, 0x950,
+    0x7c0, 0x6c9, 0x5c3, 0x4ca, 0x3c6, 0x2cf, 0x1c5, 0xcc,
+    0xfcc, 0xec5, 0xdcf, 0xcc6, 0xbca, 0xac3, 0x9c9, 0x8c0,
+    0x8c0, 0x9c9, 0xac3, 0xbca, 0xcc6, 0xdcf, 0xec5, 0xfcc,
+    0xcc, 0x1c5, 0x2cf, 0x3c6, 0x4ca, 0x5c3, 0x6c9, 0x7c0,
+    0x950, 0x859, 0xb53, 0xa5a, 0xd56, 0xc5f, 0xf55, 0xe5c,
+    0x15c, 0x55, 0x35f, 0x256, 0x55a, 0x453, 0x759, 0x650,
+    0xaf0, 0xbf9, 0x8f3, 0x9fa, 0xef6, 0xfff, 0xcf5, 0xdfc,
+    0x2fc, 0x3f5, 0xff, 0x1f6, 0x6fa, 0x7f3, 0x4f9, 0x5f0,
+    0xb60, 0xa69, 0x963, 0x86a, 0xf66, 0xe6f, 0xd65, 0xc6c,
+    0x36c, 0x265, 0x16f, 0x66, 0x76a, 0x663, 0x569, 0x460,
+    0xca0, 0xda9, 0xea3, 0xfaa, 0x8a6, 0x9af, 0xaa5, 0xbac,
+    0x4ac, 0x5a5, 0x6af, 0x7a6, 0xaa, 0x1a3, 0x2a9, 0x3a0,
+    0xd30, 0xc39, 0xf33, 0xe3a, 0x936, 0x83f, 0xb35, 0xa3c,
+    0x53c, 0x435, 0x73f, 0x636, 0x13a, 0x33, 0x339, 0x230,
+    0xe90, 0xf99, 0xc93, 0xd9a, 0xa96, 0xb9f, 0x895, 0x99c,
+    0x69c, 0x795, 0x49f, 0x596, 0x29a, 0x393, 0x99, 0x190,
+    0xf00, 0xe09, 0xd03, 0xc0a, 0xb06, 0xa0f, 0x905, 0x80c,
+    0x70c, 0x605, 0x50f, 0x406, 0x30a, 0x203, 0x109, 0x0
+]
 
+# Standard marching cubes triangle table: for each of the 256 cube configs,
+# up to 5 triangles (15 edge indices), terminated by -1.
+_TRI_TABLE = [
+    [-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [0,8,3,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [0,1,9,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [1,8,3,9,8,1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [1,2,10,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [0,8,3,1,2,10,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [9,2,10,0,2,9,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [2,8,3,2,10,8,10,9,8,-1,-1,-1,-1,-1,-1,-1],
+    [3,11,2,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [0,11,2,8,11,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [1,9,0,2,3,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [1,11,2,1,9,11,9,8,11,-1,-1,-1,-1,-1,-1,-1],
+    [3,10,1,11,10,3,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [0,10,1,0,8,10,8,11,10,-1,-1,-1,-1,-1,-1,-1],
+    [3,9,0,3,11,9,11,10,9,-1,-1,-1,-1,-1,-1,-1],
+    [9,8,10,10,8,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [4,7,8,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [4,3,0,7,3,4,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [0,1,9,8,4,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [4,1,9,4,7,1,7,3,1,-1,-1,-1,-1,-1,-1,-1],
+    [1,2,10,8,4,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [3,4,7,3,0,4,1,2,10,-1,-1,-1,-1,-1,-1,-1],
+    [9,2,10,9,0,2,8,4,7,-1,-1,-1,-1,-1,-1,-1],
+    [2,10,9,2,9,7,2,7,3,7,9,4,-1,-1,-1,-1],
+    [8,4,7,3,11,2,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [11,4,7,11,2,4,2,0,4,-1,-1,-1,-1,-1,-1,-1],
+    [9,0,1,8,4,7,2,3,11,-1,-1,-1,-1,-1,-1,-1],
+    [4,7,11,9,4,11,9,11,2,9,2,1,-1,-1,-1,-1],
+    [3,10,1,3,11,10,7,8,4,-1,-1,-1,-1,-1,-1,-1],
+    [1,11,10,1,4,11,1,0,4,7,11,4,-1,-1,-1,-1],
+    [4,7,8,9,0,11,9,11,10,11,0,3,-1,-1,-1,-1],
+    [4,7,11,4,11,9,9,11,10,-1,-1,-1,-1,-1,-1,-1],
+    [9,5,4,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [9,5,4,0,8,3,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [0,5,4,1,5,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [8,5,4,8,3,5,3,1,5,-1,-1,-1,-1,-1,-1,-1],
+    [1,2,10,9,5,4,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [3,0,8,1,2,10,4,9,5,-1,-1,-1,-1,-1,-1,-1],
+    [5,2,10,5,4,2,4,0,2,-1,-1,-1,-1,-1,-1,-1],
+    [2,10,5,3,2,5,3,5,4,3,4,8,-1,-1,-1,-1],
+    [9,5,4,2,3,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [0,11,2,0,8,11,4,9,5,-1,-1,-1,-1,-1,-1,-1],
+    [0,5,4,0,1,5,2,3,11,-1,-1,-1,-1,-1,-1,-1],
+    [2,1,5,2,5,8,2,8,11,4,8,5,-1,-1,-1,-1],
+    [10,3,11,10,1,3,9,5,4,-1,-1,-1,-1,-1,-1,-1],
+    [4,9,5,0,8,1,8,10,1,8,11,10,-1,-1,-1,-1],
+    [5,4,0,5,0,11,5,11,10,11,0,3,-1,-1,-1,-1],
+    [5,4,8,5,8,10,10,8,11,-1,-1,-1,-1,-1,-1,-1],
+    [9,7,8,5,7,9,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [9,3,0,9,5,3,5,7,3,-1,-1,-1,-1,-1,-1,-1],
+    [0,7,8,0,1,7,1,5,7,-1,-1,-1,-1,-1,-1,-1],
+    [1,5,3,3,5,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [9,7,8,9,5,7,10,1,2,-1,-1,-1,-1,-1,-1,-1],
+    [10,1,2,9,5,0,5,3,0,5,7,3,-1,-1,-1,-1],
+    [8,0,2,8,2,5,8,5,7,10,5,2,-1,-1,-1,-1],
+    [2,10,5,2,5,3,3,5,7,-1,-1,-1,-1,-1,-1,-1],
+    [7,9,5,7,8,9,3,11,2,-1,-1,-1,-1,-1,-1,-1],
+    [9,5,7,9,7,2,9,2,0,2,7,11,-1,-1,-1,-1],
+    [2,3,11,0,1,8,1,7,8,1,5,7,-1,-1,-1,-1],
+    [11,2,1,11,1,7,7,1,5,-1,-1,-1,-1,-1,-1,-1],
+    [9,5,8,8,5,7,10,1,3,10,3,11,-1,-1,-1,-1],
+    [5,7,0,5,0,9,7,11,0,1,0,10,11,10,0,-1],
+    [11,10,0,11,0,3,10,5,0,8,0,7,5,7,0,-1],
+    [11,10,5,7,11,5,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [10,6,5,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [0,8,3,5,10,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [9,0,1,5,10,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [1,8,3,1,9,8,5,10,6,-1,-1,-1,-1,-1,-1,-1],
+    [1,6,5,2,6,1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [1,6,5,1,2,6,3,0,8,-1,-1,-1,-1,-1,-1,-1],
+    [9,6,5,9,0,6,0,2,6,-1,-1,-1,-1,-1,-1,-1],
+    [5,9,8,5,8,2,5,2,6,3,2,8,-1,-1,-1,-1],
+    [2,3,11,10,6,5,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [11,0,8,11,2,0,10,6,5,-1,-1,-1,-1,-1,-1,-1],
+    [0,1,9,2,3,11,5,10,6,-1,-1,-1,-1,-1,-1,-1],
+    [5,10,6,1,9,2,9,11,2,9,8,11,-1,-1,-1,-1],
+    [6,3,11,6,5,3,5,1,3,-1,-1,-1,-1,-1,-1,-1],
+    [0,8,11,0,11,5,0,5,1,5,11,6,-1,-1,-1,-1],
+    [3,11,6,0,3,6,0,6,5,0,5,9,-1,-1,-1,-1],
+    [6,5,9,6,9,11,11,9,8,-1,-1,-1,-1,-1,-1,-1],
+    [5,10,6,4,7,8,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [4,3,0,4,7,3,6,5,10,-1,-1,-1,-1,-1,-1,-1],
+    [1,9,0,5,10,6,8,4,7,-1,-1,-1,-1,-1,-1,-1],
+    [10,6,5,1,9,7,1,7,3,7,9,4,-1,-1,-1,-1],
+    [6,1,2,6,5,1,4,7,8,-1,-1,-1,-1,-1,-1,-1],
+    [1,2,5,5,2,6,3,0,4,3,4,7,-1,-1,-1,-1],
+    [8,4,7,9,0,5,0,6,5,0,2,6,-1,-1,-1,-1],
+    [7,3,9,7,9,4,3,2,9,5,9,6,2,6,9,-1],
+    [3,11,2,7,8,4,10,6,5,-1,-1,-1,-1,-1,-1,-1],
+    [5,10,6,4,7,2,4,2,0,2,7,11,-1,-1,-1,-1],
+    [0,1,9,4,7,8,2,3,11,5,10,6,-1,-1,-1,-1],
+    [9,2,1,9,11,2,9,4,11,7,11,4,5,10,6,-1],
+    [8,4,7,3,11,5,3,5,1,5,11,6,-1,-1,-1,-1],
+    [5,1,11,5,11,6,1,0,11,7,11,4,0,4,11,-1],
+    [0,5,9,0,6,5,0,3,6,11,6,3,8,4,7,-1],
+    [6,5,9,6,9,11,4,7,9,7,11,9,-1,-1,-1,-1],
+    [10,4,9,6,4,10,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [4,10,6,4,9,10,0,8,3,-1,-1,-1,-1,-1,-1,-1],
+    [10,0,1,10,6,0,6,4,0,-1,-1,-1,-1,-1,-1,-1],
+    [8,3,1,8,1,6,8,6,4,6,1,10,-1,-1,-1,-1],
+    [1,4,9,1,2,4,2,6,4,-1,-1,-1,-1,-1,-1,-1],
+    [3,0,8,1,2,9,2,4,9,2,6,4,-1,-1,-1,-1],
+    [0,2,4,4,2,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [8,3,2,8,2,4,4,2,6,-1,-1,-1,-1,-1,-1,-1],
+    [10,4,9,10,6,4,11,2,3,-1,-1,-1,-1,-1,-1,-1],
+    [0,8,2,2,8,11,4,9,10,4,10,6,-1,-1,-1,-1],
+    [3,11,2,0,1,6,0,6,4,6,1,10,-1,-1,-1,-1],
+    [6,4,1,6,1,10,4,8,1,2,1,11,8,11,1,-1],
+    [9,6,4,9,3,6,9,1,3,11,6,3,-1,-1,-1,-1],
+    [8,11,1,8,1,0,11,6,1,9,1,4,6,4,1,-1],
+    [3,11,6,3,6,0,0,6,4,-1,-1,-1,-1,-1,-1,-1],
+    [6,4,8,11,6,8,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [7,10,6,7,8,10,8,9,10,-1,-1,-1,-1,-1,-1,-1],
+    [0,7,3,0,10,7,0,9,10,6,7,10,-1,-1,-1,-1],
+    [10,6,7,1,10,7,1,7,8,1,8,0,-1,-1,-1,-1],
+    [10,6,7,10,7,1,1,7,3,-1,-1,-1,-1,-1,-1,-1],
+    [1,2,6,1,6,8,1,8,9,8,6,7,-1,-1,-1,-1],
+    [2,6,9,2,9,1,6,7,9,0,9,3,7,3,9,-1],
+    [7,8,0,7,0,6,6,0,2,-1,-1,-1,-1,-1,-1,-1],
+    [7,3,2,6,7,2,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [2,3,11,10,6,8,10,8,9,8,6,7,-1,-1,-1,-1],
+    [2,0,7,2,7,11,0,9,7,6,7,10,9,10,7,-1],
+    [1,8,0,1,7,8,1,10,7,6,7,10,2,3,11,-1],
+    [11,2,1,11,1,7,10,6,1,6,7,1,-1,-1,-1,-1],
+    [8,9,6,8,6,7,9,1,6,11,6,3,1,3,6,-1],
+    [0,9,1,11,6,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [7,8,0,7,0,6,3,11,0,11,6,0,-1,-1,-1,-1],
+    [7,11,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [7,6,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [3,0,8,11,7,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [0,1,9,11,7,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [8,1,9,8,3,1,11,7,6,-1,-1,-1,-1,-1,-1,-1],
+    [10,1,2,6,11,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [1,2,10,3,0,8,6,11,7,-1,-1,-1,-1,-1,-1,-1],
+    [2,9,0,2,10,9,6,11,7,-1,-1,-1,-1,-1,-1,-1],
+    [6,11,7,2,10,3,10,8,3,10,9,8,-1,-1,-1,-1],
+    [7,2,3,6,2,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [7,0,8,7,6,0,6,2,0,-1,-1,-1,-1,-1,-1,-1],
+    [2,7,6,2,3,7,0,1,9,-1,-1,-1,-1,-1,-1,-1],
+    [1,6,2,1,8,6,1,9,8,8,7,6,-1,-1,-1,-1],
+    [10,7,6,10,1,7,1,3,7,-1,-1,-1,-1,-1,-1,-1],
+    [10,7,6,1,7,10,1,8,7,1,0,8,-1,-1,-1,-1],
+    [0,3,7,0,7,10,0,10,9,6,10,7,-1,-1,-1,-1],
+    [7,6,10,7,10,8,8,10,9,-1,-1,-1,-1,-1,-1,-1],
+    [6,8,4,11,8,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [3,6,11,3,0,6,0,4,6,-1,-1,-1,-1,-1,-1,-1],
+    [8,6,11,8,4,6,9,0,1,-1,-1,-1,-1,-1,-1,-1],
+    [9,4,6,9,6,3,9,3,1,11,3,6,-1,-1,-1,-1],
+    [6,8,4,6,11,8,2,10,1,-1,-1,-1,-1,-1,-1,-1],
+    [1,2,10,3,0,11,0,6,11,0,4,6,-1,-1,-1,-1],
+    [4,11,8,4,6,11,0,2,9,2,10,9,-1,-1,-1,-1],
+    [10,9,3,10,3,2,9,4,3,11,3,6,4,6,3,-1],
+    [8,2,3,8,4,2,4,6,2,-1,-1,-1,-1,-1,-1,-1],
+    [0,4,2,4,6,2,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [1,9,0,2,3,4,2,4,6,4,3,8,-1,-1,-1,-1],
+    [1,9,4,1,4,2,2,4,6,-1,-1,-1,-1,-1,-1,-1],
+    [8,1,3,8,6,1,8,4,6,6,10,1,-1,-1,-1,-1],
+    [10,1,0,10,0,6,6,0,4,-1,-1,-1,-1,-1,-1,-1],
+    [4,6,3,4,3,8,6,10,3,0,3,9,10,9,3,-1],
+    [10,9,4,6,10,4,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [4,9,5,7,6,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [0,8,3,4,9,5,11,7,6,-1,-1,-1,-1,-1,-1,-1],
+    [5,0,1,5,4,0,7,6,11,-1,-1,-1,-1,-1,-1,-1],
+    [11,7,6,8,3,4,3,5,4,3,1,5,-1,-1,-1,-1],
+    [9,5,4,10,1,2,7,6,11,-1,-1,-1,-1,-1,-1,-1],
+    [6,11,7,1,2,10,0,8,3,4,9,5,-1,-1,-1,-1],
+    [7,6,11,5,4,10,4,2,10,4,0,2,-1,-1,-1,-1],
+    [3,4,8,3,5,4,3,2,5,10,5,2,11,7,6,-1],
+    [7,2,3,7,6,2,5,4,9,-1,-1,-1,-1,-1,-1,-1],
+    [9,5,4,0,8,6,0,6,2,6,8,7,-1,-1,-1,-1],
+    [3,6,2,3,7,6,1,5,0,5,4,0,-1,-1,-1,-1],
+    [6,2,8,6,8,7,2,1,8,4,8,5,1,5,8,-1],
+    [9,5,4,10,1,6,1,7,6,1,3,7,-1,-1,-1,-1],
+    [1,6,10,1,7,6,1,0,7,8,7,0,9,5,4,-1],
+    [4,0,10,4,10,5,0,3,10,6,10,7,3,7,10,-1],
+    [7,6,10,7,10,8,5,4,10,4,8,10,-1,-1,-1,-1],
+    [6,9,5,6,11,9,11,8,9,-1,-1,-1,-1,-1,-1,-1],
+    [3,6,11,0,6,3,0,5,6,0,9,5,-1,-1,-1,-1],
+    [0,11,8,0,5,11,0,1,5,5,6,11,-1,-1,-1,-1],
+    [6,11,3,6,3,5,5,3,1,-1,-1,-1,-1,-1,-1,-1],
+    [1,2,10,9,5,11,9,11,8,11,5,6,-1,-1,-1,-1],
+    [0,11,3,0,6,11,0,9,6,5,6,9,1,2,10,-1],
+    [11,8,5,11,5,6,8,0,5,10,5,2,0,2,5,-1],
+    [6,11,3,6,3,5,2,10,3,10,5,3,-1,-1,-1,-1],
+    [5,8,9,5,2,8,5,6,2,3,8,2,-1,-1,-1,-1],
+    [9,5,6,9,6,0,0,6,2,-1,-1,-1,-1,-1,-1,-1],
+    [1,5,8,1,8,0,5,6,8,3,8,2,6,2,8,-1],
+    [1,5,6,2,1,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [1,3,6,1,6,10,3,8,6,5,6,9,8,9,6,-1],
+    [10,1,0,10,0,6,9,5,0,5,6,0,-1,-1,-1,-1],
+    [0,3,8,5,6,10,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [10,5,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [11,5,10,7,5,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [11,5,10,11,7,5,8,3,0,-1,-1,-1,-1,-1,-1,-1],
+    [5,11,7,5,10,11,1,9,0,-1,-1,-1,-1,-1,-1,-1],
+    [10,7,5,10,11,7,9,8,1,8,3,1,-1,-1,-1,-1],
+    [11,1,2,11,7,1,7,5,1,-1,-1,-1,-1,-1,-1,-1],
+    [0,8,3,1,2,7,1,7,5,7,2,11,-1,-1,-1,-1],
+    [9,7,5,9,2,7,9,0,2,2,11,7,-1,-1,-1,-1],
+    [7,5,2,7,2,11,5,9,2,3,2,8,9,8,2,-1],
+    [2,5,10,2,3,5,3,7,5,-1,-1,-1,-1,-1,-1,-1],
+    [8,2,0,8,5,2,8,7,5,10,2,5,-1,-1,-1,-1],
+    [9,0,1,5,10,3,5,3,7,3,10,2,-1,-1,-1,-1],
+    [9,8,2,9,2,1,8,7,2,10,2,5,7,5,2,-1],
+    [1,3,5,3,7,5,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [0,8,7,0,7,1,1,7,5,-1,-1,-1,-1,-1,-1,-1],
+    [9,0,3,9,3,5,5,3,7,-1,-1,-1,-1,-1,-1,-1],
+    [9,8,7,5,9,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [5,8,4,5,10,8,10,11,8,-1,-1,-1,-1,-1,-1,-1],
+    [5,0,4,5,11,0,5,10,11,11,3,0,-1,-1,-1,-1],
+    [0,1,9,8,4,10,8,10,11,10,4,5,-1,-1,-1,-1],
+    [10,11,4,10,4,5,11,3,4,9,4,1,3,1,4,-1],
+    [2,5,1,2,8,5,2,11,8,4,5,8,-1,-1,-1,-1],
+    [0,4,11,0,11,3,4,5,11,2,11,1,5,1,11,-1],
+    [0,2,5,0,5,9,2,11,5,4,5,8,11,8,5,-1],
+    [9,4,5,2,11,3,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [2,5,10,3,5,2,3,4,5,3,8,4,-1,-1,-1,-1],
+    [5,10,2,5,2,4,4,2,0,-1,-1,-1,-1,-1,-1,-1],
+    [3,10,2,3,5,10,3,8,5,4,5,8,0,1,9,-1],
+    [5,10,2,5,2,4,1,9,2,9,4,2,-1,-1,-1,-1],
+    [8,4,5,8,5,3,3,5,1,-1,-1,-1,-1,-1,-1,-1],
+    [0,4,5,1,0,5,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [8,4,5,8,5,3,9,0,5,0,3,5,-1,-1,-1,-1],
+    [9,4,5,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [4,11,7,4,9,11,9,10,11,-1,-1,-1,-1,-1,-1,-1],
+    [0,8,3,4,9,7,9,11,7,9,10,11,-1,-1,-1,-1],
+    [1,10,11,1,11,4,1,4,0,7,4,11,-1,-1,-1,-1],
+    [3,1,4,3,4,8,1,10,4,7,4,11,10,11,4,-1],
+    [4,11,7,9,11,4,9,2,11,9,1,2,-1,-1,-1,-1],
+    [9,7,4,9,11,7,9,1,11,2,11,1,0,8,3,-1],
+    [11,7,4,11,4,2,2,4,0,-1,-1,-1,-1,-1,-1,-1],
+    [11,7,4,11,4,2,8,3,4,3,2,4,-1,-1,-1,-1],
+    [2,9,10,2,7,9,2,3,7,7,4,9,-1,-1,-1,-1],
+    [9,10,7,9,7,4,10,2,7,8,7,0,2,0,7,-1],
+    [3,7,10,3,10,2,7,4,10,1,10,0,4,0,10,-1],
+    [1,10,2,8,7,4,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [4,9,1,4,1,7,7,1,3,-1,-1,-1,-1,-1,-1,-1],
+    [4,9,1,4,1,7,0,8,1,8,7,1,-1,-1,-1,-1],
+    [4,0,3,7,4,3,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [4,8,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [9,10,8,10,11,8,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [3,0,9,3,9,11,11,9,10,-1,-1,-1,-1,-1,-1,-1],
+    [0,1,10,0,10,8,8,10,11,-1,-1,-1,-1,-1,-1,-1],
+    [3,1,10,11,3,10,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [1,2,11,1,11,9,9,11,8,-1,-1,-1,-1,-1,-1,-1],
+    [3,0,9,3,9,11,1,2,9,2,11,9,-1,-1,-1,-1],
+    [0,2,11,8,0,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [3,2,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [2,3,8,2,8,10,10,8,9,-1,-1,-1,-1,-1,-1,-1],
+    [9,10,2,0,9,2,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [2,3,8,2,8,10,0,1,8,1,10,8,-1,-1,-1,-1],
+    [1,10,2,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [1,3,8,9,1,8,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [0,9,1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [0,3,8,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+    [-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
+]
+
+# Upload lookup tables to Taichi fields
+mc_edge_table = ti.field(dtype=ti.i32, shape=256)
+mc_edge_table.from_numpy(np.array(_EDGE_TABLE, dtype=np.int32))
+
+mc_tri_table = ti.field(dtype=ti.i32, shape=(256, 16))
+mc_tri_table.from_numpy(np.array(_TRI_TABLE, dtype=np.int32))
+
+# Output triangle buffers for marching cubes
+# Each cell can produce up to 5 triangles. Total cells = MC_RES^3.
+# We use an atomic counter and a flat buffer.
+MAX_MC_TRIS = 200000
+mc_tri_count = ti.field(dtype=ti.i32, shape=())
+# Each triangle: 3 vertices + 3 normals (stored as world-space positions, normals computed from gradient)
+mc_verts = ti.Vector.field(3, dtype=ti.f32, shape=(MAX_MC_TRIS, 3))  # [tri_idx, vert_idx]
+mc_normals = ti.Vector.field(3, dtype=ti.f32, shape=(MAX_MC_TRIS, 3))
+
+
+@ti.func
+def mc_interp_vertex(iso: ti.f32, p1: ti.template(), p2: ti.template(),
+                     v1: ti.f32, v2: ti.f32) -> ti.template():
+    """Interpolate vertex position along an edge based on iso value."""
+    result = p1
+    if ti.abs(v1 - v2) > 1e-10:
+        t = (iso - v1) / (v2 - v1)
+        result = p1 + t * (p2 - p1)
+    return result
+
+
+@ti.func
+def mc_grid_pos(ix: ti.i32, iy: ti.i32, iz: ti.i32) -> ti.template():
+    """World position of a grid vertex."""
+    return ti.Vector([DOMAIN_MIN + ix * MC_CELL,
+                      DOMAIN_MIN + iy * MC_CELL,
+                      DOMAIN_MIN + iz * MC_CELL])
+
+
+@ti.func
+def mc_grid_normal(ix: ti.i32, iy: ti.i32, iz: ti.i32) -> ti.template():
+    """Compute normal at grid vertex using central differences on density_grid."""
+    # Gradient of density field = normal pointing away from surface
+    nx = 0.0
+    ny = 0.0
+    nz = 0.0
+    if ix > 0 and ix < MC_RES:
+        nx = density_grid[ix + 1, iy, iz] - density_grid[ix - 1, iy, iz]
+    elif ix == 0:
+        nx = density_grid[ix + 1, iy, iz] - density_grid[ix, iy, iz]
+    else:
+        nx = density_grid[ix, iy, iz] - density_grid[ix - 1, iy, iz]
+
+    if iy > 0 and iy < MC_RES:
+        ny = density_grid[ix, iy + 1, iz] - density_grid[ix, iy - 1, iz]
+    elif iy == 0:
+        ny = density_grid[ix, iy + 1, iz] - density_grid[ix, iy, iz]
+    else:
+        ny = density_grid[ix, iy, iz] - density_grid[ix, iy - 1, iz]
+
+    if iz > 0 and iz < MC_RES:
+        nz = density_grid[ix, iy, iz + 1] - density_grid[ix, iy, iz - 1]
+    elif iz == 0:
+        nz = density_grid[ix, iy, iz + 1] - density_grid[ix, iy, iz]
+    else:
+        nz = density_grid[ix, iy, iz] - density_grid[ix, iy, iz - 1]
+
+    n = ti.Vector([nx, ny, nz])
+    length = n.norm()
+    if length > 1e-8:
+        n = -n / length  # Flip to point outward (from high to low density)
+    return n
+
+
+@ti.func
+def mc_interp_normal(iso: ti.f32, n1: ti.template(), n2: ti.template(),
+                     v1: ti.f32, v2: ti.f32) -> ti.template():
+    """Interpolate normal along an edge."""
+    result = n1
+    if ti.abs(v1 - v2) > 1e-10:
+        t = (iso - v1) / (v2 - v1)
+        result = n1 + t * (n2 - n1)
+    length = result.norm()
+    if length > 1e-8:
+        result = result / length
+    return result
+
+
+@ti.kernel
+def reset_mc_counter():
+    mc_tri_count[None] = 0
+
+
+@ti.kernel
+def gpu_marching_cubes(iso: ti.f32):
+    """Full marching cubes on GPU. Each cell processed in parallel."""
+    ti.loop_config(block_dim=64)
+    for idx in range(MC_RES * MC_RES * MC_RES):
+        ix = idx // (MC_RES * MC_RES)
+        iy = (idx // MC_RES) % MC_RES
+        iz = idx % MC_RES
+
+        # 8 corner values
+        v0 = density_grid[ix, iy, iz]
+        v1 = density_grid[ix + 1, iy, iz]
+        v2 = density_grid[ix + 1, iy + 1, iz]
+        v3 = density_grid[ix, iy + 1, iz]
+        v4 = density_grid[ix, iy, iz + 1]
+        v5 = density_grid[ix + 1, iy, iz + 1]
+        v6 = density_grid[ix + 1, iy + 1, iz + 1]
+        v7 = density_grid[ix, iy + 1, iz + 1]
+
+        # Cube index from corner signs
+        cube_index = 0
+        if v0 < iso: cube_index |= 1
+        if v1 < iso: cube_index |= 2
+        if v2 < iso: cube_index |= 4
+        if v3 < iso: cube_index |= 8
+        if v4 < iso: cube_index |= 16
+        if v5 < iso: cube_index |= 32
+        if v6 < iso: cube_index |= 64
+        if v7 < iso: cube_index |= 128
+
+        edge_bits = mc_edge_table[cube_index]
+
+        if edge_bits != 0:
+            # 8 corner positions
+            p0 = mc_grid_pos(ix, iy, iz)
+            p1 = mc_grid_pos(ix + 1, iy, iz)
+            p2 = mc_grid_pos(ix + 1, iy + 1, iz)
+            p3 = mc_grid_pos(ix, iy + 1, iz)
+            p4 = mc_grid_pos(ix, iy, iz + 1)
+            p5 = mc_grid_pos(ix + 1, iy, iz + 1)
+            p6 = mc_grid_pos(ix + 1, iy + 1, iz + 1)
+            p7 = mc_grid_pos(ix, iy + 1, iz + 1)
+
+            # 8 corner normals
+            n0 = mc_grid_normal(ix, iy, iz)
+            n1 = mc_grid_normal(ix + 1, iy, iz)
+            n2 = mc_grid_normal(ix + 1, iy + 1, iz)
+            n3 = mc_grid_normal(ix, iy + 1, iz)
+            n4 = mc_grid_normal(ix, iy, iz + 1)
+            n5 = mc_grid_normal(ix + 1, iy, iz + 1)
+            n6 = mc_grid_normal(ix + 1, iy + 1, iz + 1)
+            n7 = mc_grid_normal(ix, iy + 1, iz + 1)
+
+            # Interpolate vertices and normals on active edges
+            # Use local arrays for the 12 edges
+            vert0 = ti.Vector([0.0, 0.0, 0.0])
+            vert1 = ti.Vector([0.0, 0.0, 0.0])
+            vert2 = ti.Vector([0.0, 0.0, 0.0])
+            vert3 = ti.Vector([0.0, 0.0, 0.0])
+            vert4 = ti.Vector([0.0, 0.0, 0.0])
+            vert5 = ti.Vector([0.0, 0.0, 0.0])
+            vert6 = ti.Vector([0.0, 0.0, 0.0])
+            vert7 = ti.Vector([0.0, 0.0, 0.0])
+            vert8 = ti.Vector([0.0, 0.0, 0.0])
+            vert9 = ti.Vector([0.0, 0.0, 0.0])
+            vert10 = ti.Vector([0.0, 0.0, 0.0])
+            vert11 = ti.Vector([0.0, 0.0, 0.0])
+
+            norm0 = ti.Vector([0.0, 0.0, 0.0])
+            norm1 = ti.Vector([0.0, 0.0, 0.0])
+            norm2 = ti.Vector([0.0, 0.0, 0.0])
+            norm3 = ti.Vector([0.0, 0.0, 0.0])
+            norm4 = ti.Vector([0.0, 0.0, 0.0])
+            norm5 = ti.Vector([0.0, 0.0, 0.0])
+            norm6 = ti.Vector([0.0, 0.0, 0.0])
+            norm7 = ti.Vector([0.0, 0.0, 0.0])
+            norm8 = ti.Vector([0.0, 0.0, 0.0])
+            norm9 = ti.Vector([0.0, 0.0, 0.0])
+            norm10 = ti.Vector([0.0, 0.0, 0.0])
+            norm11 = ti.Vector([0.0, 0.0, 0.0])
+
+            if edge_bits & 1:
+                vert0 = mc_interp_vertex(iso, p0, p1, v0, v1)
+                norm0 = mc_interp_normal(iso, n0, n1, v0, v1)
+            if edge_bits & 2:
+                vert1 = mc_interp_vertex(iso, p1, p2, v1, v2)
+                norm1 = mc_interp_normal(iso, n1, n2, v1, v2)
+            if edge_bits & 4:
+                vert2 = mc_interp_vertex(iso, p2, p3, v2, v3)
+                norm2 = mc_interp_normal(iso, n2, n3, v2, v3)
+            if edge_bits & 8:
+                vert3 = mc_interp_vertex(iso, p3, p0, v3, v0)
+                norm3 = mc_interp_normal(iso, n3, n0, v3, v0)
+            if edge_bits & 16:
+                vert4 = mc_interp_vertex(iso, p4, p5, v4, v5)
+                norm4 = mc_interp_normal(iso, n4, n5, v4, v5)
+            if edge_bits & 32:
+                vert5 = mc_interp_vertex(iso, p5, p6, v5, v6)
+                norm5 = mc_interp_normal(iso, n5, n6, v5, v6)
+            if edge_bits & 64:
+                vert6 = mc_interp_vertex(iso, p6, p7, v6, v7)
+                norm6 = mc_interp_normal(iso, n6, n7, v6, v7)
+            if edge_bits & 128:
+                vert7 = mc_interp_vertex(iso, p7, p4, v7, v4)
+                norm7 = mc_interp_normal(iso, n7, n4, v7, v4)
+            if edge_bits & 256:
+                vert8 = mc_interp_vertex(iso, p0, p4, v0, v4)
+                norm8 = mc_interp_normal(iso, n0, n4, v0, v4)
+            if edge_bits & 512:
+                vert9 = mc_interp_vertex(iso, p1, p5, v1, v5)
+                norm9 = mc_interp_normal(iso, n1, n5, v1, v5)
+            if edge_bits & 1024:
+                vert10 = mc_interp_vertex(iso, p2, p6, v2, v6)
+                norm10 = mc_interp_normal(iso, n2, n6, v2, v6)
+            if edge_bits & 2048:
+                vert11 = mc_interp_vertex(iso, p3, p7, v3, v7)
+                norm11 = mc_interp_normal(iso, n3, n7, v3, v7)
+
+            # Helper: map edge index to interpolated vertex/normal
+            # We can't use arrays in Taichi easily, so use a function-like approach
+            # Emit triangles from tri_table
+            k = 0
+            while k < 15:
+                e0 = mc_tri_table[cube_index, k]
+                if e0 == -1:
+                    break
+                e1 = mc_tri_table[cube_index, k + 1]
+                e2 = mc_tri_table[cube_index, k + 2]
+
+                # Map edge indices to vertices/normals
+                tv0 = ti.Vector([0.0, 0.0, 0.0])
+                tv1 = ti.Vector([0.0, 0.0, 0.0])
+                tv2 = ti.Vector([0.0, 0.0, 0.0])
+                tn0 = ti.Vector([0.0, 0.0, 0.0])
+                tn1 = ti.Vector([0.0, 0.0, 0.0])
+                tn2 = ti.Vector([0.0, 0.0, 0.0])
+
+                if e0 == 0: tv0 = vert0; tn0 = norm0
+                elif e0 == 1: tv0 = vert1; tn0 = norm1
+                elif e0 == 2: tv0 = vert2; tn0 = norm2
+                elif e0 == 3: tv0 = vert3; tn0 = norm3
+                elif e0 == 4: tv0 = vert4; tn0 = norm4
+                elif e0 == 5: tv0 = vert5; tn0 = norm5
+                elif e0 == 6: tv0 = vert6; tn0 = norm6
+                elif e0 == 7: tv0 = vert7; tn0 = norm7
+                elif e0 == 8: tv0 = vert8; tn0 = norm8
+                elif e0 == 9: tv0 = vert9; tn0 = norm9
+                elif e0 == 10: tv0 = vert10; tn0 = norm10
+                elif e0 == 11: tv0 = vert11; tn0 = norm11
+
+                if e1 == 0: tv1 = vert0; tn1 = norm0
+                elif e1 == 1: tv1 = vert1; tn1 = norm1
+                elif e1 == 2: tv1 = vert2; tn1 = norm2
+                elif e1 == 3: tv1 = vert3; tn1 = norm3
+                elif e1 == 4: tv1 = vert4; tn1 = norm4
+                elif e1 == 5: tv1 = vert5; tn1 = norm5
+                elif e1 == 6: tv1 = vert6; tn1 = norm6
+                elif e1 == 7: tv1 = vert7; tn1 = norm7
+                elif e1 == 8: tv1 = vert8; tn1 = norm8
+                elif e1 == 9: tv1 = vert9; tn1 = norm9
+                elif e1 == 10: tv1 = vert10; tn1 = norm10
+                elif e1 == 11: tv1 = vert11; tn1 = norm11
+
+                if e2 == 0: tv2 = vert0; tn2 = norm0
+                elif e2 == 1: tv2 = vert1; tn2 = norm1
+                elif e2 == 2: tv2 = vert2; tn2 = norm2
+                elif e2 == 3: tv2 = vert3; tn2 = norm3
+                elif e2 == 4: tv2 = vert4; tn2 = norm4
+                elif e2 == 5: tv2 = vert5; tn2 = norm5
+                elif e2 == 6: tv2 = vert6; tn2 = norm6
+                elif e2 == 7: tv2 = vert7; tn2 = norm7
+                elif e2 == 8: tv2 = vert8; tn2 = norm8
+                elif e2 == 9: tv2 = vert9; tn2 = norm9
+                elif e2 == 10: tv2 = vert10; tn2 = norm10
+                elif e2 == 11: tv2 = vert11; tn2 = norm11
+
+                tri_idx = ti.atomic_add(mc_tri_count[None], 1)
+                if tri_idx < MAX_MC_TRIS:
+                    mc_verts[tri_idx, 0] = tv0
+                    mc_verts[tri_idx, 1] = tv1
+                    mc_verts[tri_idx, 2] = tv2
+                    mc_normals[tri_idx, 0] = tn0
+                    mc_normals[tri_idx, 1] = tn1
+                    mc_normals[tri_idx, 2] = tn2
+
+                k += 3
+
+
+# ============================================================
+# GPU vertex transform + rasterization (no CPU sorting needed)
+# ============================================================
 
 LIGHT_DIR = np.array([0.4, 0.7, 0.5])
 LIGHT_DIR = LIGHT_DIR / np.linalg.norm(LIGHT_DIR)
@@ -312,16 +869,16 @@ HALF_VEC = LIGHT_DIR + VIEW_DIR
 HALF_VEC = HALF_VEC / np.linalg.norm(HALF_VEC)
 
 # Mouse interaction force
-MOUSE_RADIUS = 0.2         # world-space radius of influence
-MOUSE_STRENGTH = 3.0       # direct velocity impulse
+MOUSE_RADIUS = 0.2
+MOUSE_STRENGTH = 3.0
 
 mouse_pos = ti.Vector.field(3, dtype=ti.f32, shape=())
 
 # Framebuffer for smooth-shaded software rasterizer
 framebuf = ti.Vector.field(3, dtype=ti.f32, shape=(RES, RES))
 
-# Triangle data
-MAX_TRIS = 50000
+# Triangle data for rasterizer (screen space)
+MAX_TRIS = 200000
 tri_v0 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIS)
 tri_v1 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIS)
 tri_v2 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIS)
@@ -331,6 +888,12 @@ tri_n2 = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIS)
 
 ti_light_dir = ti.Vector([float(LIGHT_DIR[0]), float(LIGHT_DIR[1]), float(LIGHT_DIR[2])])
 ti_half_vec = ti.Vector([float(HALF_VEC[0]), float(HALF_VEC[1]), float(HALF_VEC[2])])
+
+# Camera parameters as Taichi fields so transform runs on GPU
+cam_cos_a = ti.field(dtype=ti.f32, shape=())
+cam_sin_a = ti.field(dtype=ti.f32, shape=())
+cam_cos_t = ti.field(dtype=ti.f32, shape=())
+cam_sin_t = ti.field(dtype=ti.f32, shape=())
 
 
 @ti.func
@@ -350,7 +913,59 @@ def edge_func(a: ti.template(), b: ti.template(), c: ti.template()) -> ti.f32:
     return (c.x - a.x) * (b.y - a.y) - (c.y - a.y) * (b.x - a.x)
 
 
-zbuf = ti.field(dtype=ti.i32, shape=(RES, RES))  # integer Z for atomic_max
+zbuf = ti.field(dtype=ti.i32, shape=(RES, RES))
+
+
+@ti.func
+def transform_point(p: ti.template()) -> ti.template():
+    """Transform world-space point to screen-space."""
+    cos_a = cam_cos_a[None]
+    sin_a = cam_sin_a[None]
+    cos_t = cam_cos_t[None]
+    sin_t = cam_sin_t[None]
+    vx = p.x - 0.5
+    vy = p.y - 0.5
+    vz = p.z - 0.5
+    x_rot = vx * cos_a + vz * sin_a
+    z_rot = -vx * sin_a + vz * cos_a
+    y_proj = vy * cos_t - z_rot * sin_t
+    z_proj = vy * sin_t + z_rot * cos_t
+    scale = 0.85
+    sx = (x_rot * scale + 0.5) * RES
+    sy = (y_proj * scale + 0.5) * RES
+    return ti.Vector([sx, sy, z_proj])
+
+
+@ti.func
+def rotate_normal(n: ti.template()) -> ti.template():
+    """Rotate normal by camera angles."""
+    cos_a = cam_cos_a[None]
+    sin_a = cam_sin_a[None]
+    cos_t = cam_cos_t[None]
+    sin_t = cam_sin_t[None]
+    nx = n.x * cos_a + n.z * sin_a
+    nz = -n.x * sin_a + n.z * cos_a
+    ny_r = n.y * cos_t - nz * sin_t
+    nz_r = n.y * sin_t + nz * cos_t
+    result = ti.Vector([nx, ny_r, nz_r])
+    length = result.norm()
+    if length > 1e-8:
+        result = result / length
+    return result
+
+
+@ti.kernel
+def transform_and_prepare(n_tris: ti.i32):
+    """Transform MC output to screen space and prepare for rasterization. All on GPU."""
+    for t in range(n_tris):
+        # Transform vertices to screen space
+        tri_v0[t] = transform_point(mc_verts[t, 0])
+        tri_v1[t] = transform_point(mc_verts[t, 1])
+        tri_v2[t] = transform_point(mc_verts[t, 2])
+        # Rotate normals
+        tri_n0[t] = rotate_normal(mc_normals[t, 0])
+        tri_n1[t] = rotate_normal(mc_normals[t, 1])
+        tri_n2[t] = rotate_normal(mc_normals[t, 2])
 
 
 @ti.kernel
@@ -391,7 +1006,6 @@ def rasterize_batch(batch_start: ti.i32, batch_end: ti.i32):
                     w2 = 1.0 - w0 - w1
                     if w0 >= 0.0 and w1 >= 0.0 and w2 >= 0.0:
                         z = w0 * v0.z + w1 * v1.z + w2 * v2.z
-                        # Scale Z to int for atomic_max (avoids float race)
                         z_int = int(z * 1e6)
                         old = ti.atomic_max(zbuf[px, py], z_int)
                         if z_int >= old:
@@ -410,89 +1024,51 @@ def apply_mouse_force():
             vel[i] += strength * r / dist
 
 
-def transform_verts(verts, cam_angle, cam_tilt):
-    cos_a = math.cos(cam_angle)
-    sin_a = math.sin(cam_angle)
-    cos_t = math.cos(cam_tilt)
-    sin_t = math.sin(cam_tilt)
-    vx = verts[:, 0] - 0.5
-    vy = verts[:, 1] - 0.5
-    vz = verts[:, 2] - 0.5
-    x_rot = vx * cos_a + vz * sin_a
-    z_rot = -vx * sin_a + vz * cos_a
-    y_proj = vy * cos_t - z_rot * sin_t
-    z_proj = vy * sin_t + z_rot * cos_t
-    scale = 0.85
-    sx = (x_rot * scale + 0.5) * RES
-    sy = (y_proj * scale + 0.5) * RES
-    return np.column_stack([sx, sy, z_proj])
-
-
-def rotate_normals(normals, cam_angle, cam_tilt):
-    cos_a = math.cos(cam_angle)
-    sin_a = math.sin(cam_angle)
-    cos_t = math.cos(cam_tilt)
-    sin_t = math.sin(cam_tilt)
-    nx = normals[:, 0] * cos_a + normals[:, 2] * sin_a
-    nz = -normals[:, 0] * sin_a + normals[:, 2] * cos_a
-    ny_r = normals[:, 1] * cos_t - nz * sin_t
-    nz_r = normals[:, 1] * sin_t + nz * cos_t
-    rot = np.column_stack([nx, ny_r, nz_r])
-    lengths = np.linalg.norm(rot, axis=1, keepdims=True).clip(1e-8)
-    rot /= lengths
-    return rot.astype(np.float32)
-
-
 def screen_to_world(sx, sy, cam_angle, cam_tilt):
-    """Unproject screen coords [0,1] back to world space.
-
-    We have screen (sx, sy) and need world (x, y, z). Since 3D->2D loses
-    depth, we sweep z_proj and find the point that hits a target Y plane
-    (the water surface height). This properly inverts the full rotation.
-
-    Forward transform was:
-      vx, vy, vz = world - 0.5
-      x_rot = vx*cos_a + vz*sin_a
-      z_rot = -vx*sin_a + vz*cos_a
-      y_proj = vy*cos_t - z_rot*sin_t
-      sx = x_rot * scale + 0.5
-      sy = y_proj * scale + 0.5
-    """
+    """Unproject screen coords [0,1] back to world space."""
     cos_a = math.cos(cam_angle)
     sin_a = math.sin(cam_angle)
     cos_t = math.cos(cam_tilt)
     sin_t = math.sin(cam_tilt)
     scale = 0.85
-
-    # Invert screen to rotated space
     x_rot = (sx - 0.5) / scale
     y_proj = (sy - 0.5) / scale
-
-    # We need to pick a z_rot to resolve the ambiguity.
-    # Use z_rot = 0 (center depth), then solve for vy and vx/vz.
-    # y_proj = vy*cos_t - z_rot*sin_t  =>  vy = (y_proj + z_rot*sin_t) / cos_t
-    # x_rot  = vx*cos_a + vz*sin_a
-    # z_rot  = -vx*sin_a + vz*cos_a
-    # With z_rot = 0: vz = vx * sin_a / cos_a (if cos_a != 0)
-    # Substituting into x_rot equation:
-    #   x_rot = vx*cos_a + (vx*sin_a/cos_a)*sin_a = vx*(cos_a + sin_a^2/cos_a) = vx/cos_a
-    # So vx = x_rot * cos_a
-
-    # Actually, solve the 2x2 system for vx, vz given x_rot and z_rot=0:
-    #   x_rot = vx*cos_a + vz*sin_a
-    #   0     = -vx*sin_a + vz*cos_a  =>  vz = vx*sin_a/cos_a
-    # Sub: x_rot = vx*cos_a + vx*sin_a^2/cos_a = vx*(cos_a^2 + sin_a^2)/cos_a = vx/cos_a
     vx = x_rot * cos_a
     vz = x_rot * sin_a
     vy = y_proj / cos_t if abs(cos_t) > 0.01 else 0.0
-
     return np.array([vx + 0.5, vy + 0.5, vz + 0.5])
+
+
+def initialize():
+    spacing = PARTICLE_DIAMETER
+    positions = []
+    x = 0.05
+    while x < 0.55 and len(positions) < NUM_FLUID:
+        y = 0.05
+        while y < 0.85 and len(positions) < NUM_FLUID:
+            z = 0.05
+            while z < 0.55 and len(positions) < NUM_FLUID:
+                positions.append([x, y, z])
+                z += spacing
+            y += spacing
+        x += spacing
+    n = min(len(positions), NUM_FLUID)
+    fluid_pos = np.array(positions[:n], dtype=np.float32)
+    if n < NUM_FLUID:
+        extra = NUM_FLUID - n
+        pad = np.random.uniform(0.05, 0.45, (extra, 3)).astype(np.float32)
+        fluid_pos = np.vstack([fluid_pos, pad])
+
+    all_pos = np.vstack([fluid_pos, BOUNDARY_POS])
+    pos.from_numpy(all_pos)
+    vel.from_numpy(np.zeros((NUM_FLUID, 3), dtype=np.float32))
+    print(f"Initialized {n} fluid + {NUM_BOUNDARY} boundary particles")
 
 
 def main():
     initialize()
 
-    gui = ti.GUI("PBD Dam Break + Shaded Surface", res=(RES, RES),
+    gui = ti.GUI("PBD Dam Break + GPU Surface", res=(RES, RES),
                  background_color=0xC7C7C7)
 
     paused = False
@@ -514,7 +1090,6 @@ def main():
             elif e.key == 'r':
                 initialize()
 
-        # Arrow keys for camera (check held state)
         if gui.is_pressed(gui.LEFT):
             cam_angle -= rot_speed
         if gui.is_pressed(gui.RIGHT):
@@ -524,7 +1099,6 @@ def main():
         if gui.is_pressed(gui.DOWN):
             cam_tilt = max(cam_tilt - rot_speed, -0.2)
 
-        # Mouse interaction — push water on LMB
         if gui.is_pressed(gui.LMB):
             mx, my = gui.get_cursor_pos()
             wp = screen_to_world(mx, my, cam_angle, cam_tilt)
@@ -543,38 +1117,23 @@ def main():
                     enforce_boundary()
                 update_velocity()
 
-        # Surface reconstruction and rendering
+        # Update camera trig values for GPU transform
+        cam_cos_a[None] = math.cos(cam_angle)
+        cam_sin_a[None] = math.sin(cam_angle)
+        cam_cos_t[None] = math.cos(cam_tilt)
+        cam_sin_t[None] = math.sin(cam_tilt)
+
+        # Full GPU rendering pipeline: splat -> marching cubes -> transform -> rasterize
         clear_framebuf()
         splat_density()
-        dg = density_grid.to_numpy()
-        try:
-            verts, faces, normals, _ = marching_cubes(dg, level=iso_threshold,
-                                                       spacing=(MC_CELL, MC_CELL, MC_CELL))
-            verts += DOMAIN_MIN
+        reset_mc_counter()
+        gpu_marching_cubes(iso_threshold)
 
-            if len(faces) > 0:
-                rot_normals = rotate_normals(normals, cam_angle, cam_tilt)
-                screen_verts = transform_verts(verts, cam_angle, cam_tilt)
+        n_tris = min(mc_tri_count[None], MAX_MC_TRIS)
+        if n_tris > 0:
+            transform_and_prepare(n_tris)
+            rasterize_batch(0, n_tris)
 
-                # Sort back-to-front
-                face_z = (screen_verts[faces[:, 0], 2] +
-                          screen_verts[faces[:, 1], 2] +
-                          screen_verts[faces[:, 2], 2]) / 3.0
-                order = np.argsort(face_z)
-                faces_sorted = faces[order]
-
-                n_tris = min(len(faces_sorted), MAX_TRIS)
-                f = faces_sorted[:n_tris]
-                tri_v0.from_numpy(screen_verts[f[:, 0]].astype(np.float32))
-                tri_v1.from_numpy(screen_verts[f[:, 1]].astype(np.float32))
-                tri_v2.from_numpy(screen_verts[f[:, 2]].astype(np.float32))
-                tri_n0.from_numpy(rot_normals[f[:, 0]])
-                tri_n1.from_numpy(rot_normals[f[:, 1]])
-                tri_n2.from_numpy(rot_normals[f[:, 2]])
-
-                rasterize_batch(0, n_tris)
-        except (ValueError, IndexError):
-            pass
         gui.set_image(framebuf)
         gui.show()
         frame += 1
