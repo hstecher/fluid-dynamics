@@ -988,7 +988,8 @@ def main():
                        normals=render_normals,
                        vertex_count=n_verts,
                        index_count=n_verts,
-                       color=(0.15, 0.35, 0.65))
+                       color=(0.15, 0.35, 0.65),
+                       two_sided=True)
 
         canvas.scene(scene)
         window.show()
