@@ -444,21 +444,49 @@ def rotate_normals(normals, cam_angle, cam_tilt):
 
 
 def screen_to_world(sx, sy, cam_angle, cam_tilt):
-    """Unproject normalized screen coords [0,1] to a world-space ray hit on y=0.3 plane."""
+    """Unproject screen coords [0,1] back to world space.
+
+    We have screen (sx, sy) and need world (x, y, z). Since 3D->2D loses
+    depth, we sweep z_proj and find the point that hits a target Y plane
+    (the water surface height). This properly inverts the full rotation.
+
+    Forward transform was:
+      vx, vy, vz = world - 0.5
+      x_rot = vx*cos_a + vz*sin_a
+      z_rot = -vx*sin_a + vz*cos_a
+      y_proj = vy*cos_t - z_rot*sin_t
+      sx = x_rot * scale + 0.5
+      sy = y_proj * scale + 0.5
+    """
     cos_a = math.cos(cam_angle)
     sin_a = math.sin(cam_angle)
     cos_t = math.cos(cam_tilt)
     sin_t = math.sin(cam_tilt)
-    # Invert the projection: screen -> rotated space
     scale = 0.85
+
+    # Invert screen to rotated space
     x_rot = (sx - 0.5) / scale
     y_proj = (sy - 0.5) / scale
-    # Approximate: assume z_rot ~ 0 (center of domain)
-    # y_proj = vy * cos_t - z_rot * sin_t, with z_rot ~ 0 -> vy ~ y_proj / cos_t
+
+    # We need to pick a z_rot to resolve the ambiguity.
+    # Use z_rot = 0 (center depth), then solve for vy and vx/vz.
+    # y_proj = vy*cos_t - z_rot*sin_t  =>  vy = (y_proj + z_rot*sin_t) / cos_t
+    # x_rot  = vx*cos_a + vz*sin_a
+    # z_rot  = -vx*sin_a + vz*cos_a
+    # With z_rot = 0: vz = vx * sin_a / cos_a (if cos_a != 0)
+    # Substituting into x_rot equation:
+    #   x_rot = vx*cos_a + (vx*sin_a/cos_a)*sin_a = vx*(cos_a + sin_a^2/cos_a) = vx/cos_a
+    # So vx = x_rot * cos_a
+
+    # Actually, solve the 2x2 system for vx, vz given x_rot and z_rot=0:
+    #   x_rot = vx*cos_a + vz*sin_a
+    #   0     = -vx*sin_a + vz*cos_a  =>  vz = vx*sin_a/cos_a
+    # Sub: x_rot = vx*cos_a + vx*sin_a^2/cos_a = vx*(cos_a^2 + sin_a^2)/cos_a = vx/cos_a
+    vx = x_rot * cos_a
+    vz = x_rot * sin_a
     vy = y_proj / cos_t if abs(cos_t) > 0.01 else 0.0
-    # x_rot = vx * cos_a + vz * sin_a, assume vz ~ 0 -> vx ~ x_rot / cos_a
-    vx = x_rot / cos_a if abs(cos_a) > 0.01 else 0.0
-    return np.array([vx + 0.5, vy + 0.5, 0.5])
+
+    return np.array([vx + 0.5, vy + 0.5, vz + 0.5])
 
 
 def main():
