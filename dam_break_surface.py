@@ -38,7 +38,7 @@ GRID_DIM = int(np.ceil((DOMAIN_MAX - DOMAIN_MIN) / GRID_SIZE)) + 1
 MAX_NEIGHBORS = 96
 MAX_PER_CELL = 96
 
-MC_RES = 60
+MC_RES = 45
 MC_CELL = (DOMAIN_MAX - DOMAIN_MIN) / MC_RES
 MC_SPLAT_RADIUS = H
 
@@ -252,10 +252,14 @@ def update_velocity():
 
 
 @ti.kernel
-def splat_density():
-    """Splat FLUID particle density onto the MC grid (not boundary)."""
+def clear_density():
     for I in ti.grouped(density_grid):
         density_grid[I] = 0.0
+
+
+@ti.kernel
+def splat_density():
+    """Splat FLUID particle density onto the MC grid (not boundary)."""
     for i in range(NUM_FLUID):
         p = pos[i]
         lo_x = int(ti.floor((p.x - MC_SPLAT_RADIUS - DOMAIN_MIN) / MC_CELL))
@@ -287,6 +291,16 @@ MOUSE_STRENGTH = 3.0
 
 mouse_pos = ti.Vector.field(3, dtype=ti.f32, shape=())
 
+# Origin axis marker: 3 short lines along X (red), Y (green), Z (blue)
+AXIS_LEN = 0.15
+AXIS_ORIGIN = ti.Vector([0.0, 0.5, 0.0])  # Raised to mid-height for visibility
+axis_x_verts = ti.Vector.field(3, dtype=ti.f32, shape=2)
+axis_y_verts = ti.Vector.field(3, dtype=ti.f32, shape=2)
+axis_z_verts = ti.Vector.field(3, dtype=ti.f32, shape=2)
+axis_x_verts[0] = AXIS_ORIGIN; axis_x_verts[1] = AXIS_ORIGIN + [AXIS_LEN, 0.0, 0.0]
+axis_y_verts[0] = AXIS_ORIGIN; axis_y_verts[1] = AXIS_ORIGIN + [0.0, AXIS_LEN, 0.0]
+axis_z_verts[0] = AXIS_ORIGIN; axis_z_verts[1] = AXIS_ORIGIN + [0.0, 0.0, AXIS_LEN]
+
 # World-space triangle data from marching cubes
 MAX_MC_TRIS = 200000
 MAX_MC_VERTS = MAX_MC_TRIS * 3
@@ -295,11 +309,9 @@ mc_vertices = ti.Vector.field(3, dtype=ti.f32, shape=MAX_MC_VERTS)
 mc_normals = ti.Vector.field(3, dtype=ti.f32, shape=MAX_MC_VERTS)
 mc_indices = ti.field(dtype=ti.i32, shape=MAX_MC_VERTS)
 
-# Render fields — sized to typical MC output, not worst-case MAX_MC_VERTS.
-# scene.mesh() copies ALL vertices in the field to a numpy VBO every frame,
-# regardless of vertex_count. Using right-sized fields avoids copying 600K
-# unused vertices. GPU-side copy into these is ~10x faster overall.
-RENDER_MAX_VERTS = 60000
+# Render fields — sized to hold typical MC output. GGUI copies the entire
+# field to a VBO each frame, so oversizing kills framerate.
+RENDER_MAX_VERTS = 150000
 render_vertices = ti.Vector.field(3, dtype=ti.f32, shape=RENDER_MAX_VERTS)
 render_normals = ti.Vector.field(3, dtype=ti.f32, shape=RENDER_MAX_VERTS)
 render_indices = ti.field(dtype=ti.i32, shape=RENDER_MAX_VERTS)
@@ -966,7 +978,8 @@ def main():
                     apply_corrections_and_clamp()
                 update_velocity()
 
-        # GPU pipeline: splat density -> marching cubes
+        # GPU pipeline: clear -> splat density -> marching cubes
+        clear_density()
         splat_density()
         reset_mc_counter()
         gpu_marching_cubes(iso_threshold)
@@ -991,6 +1004,12 @@ def main():
                        color=(0.15, 0.35, 0.65),
                        two_sided=True)
 
+        # Origin axis marker: X=red, Y=green, Z=blue
+        scene.lines(axis_x_verts, width=4.0, color=(1.0, 0.0, 0.0))
+        scene.lines(axis_y_verts, width=4.0, color=(0.0, 1.0, 0.0))
+        scene.lines(axis_z_verts, width=4.0, color=(0.0, 0.0, 1.0))
+
+        canvas.set_background_color((0.8, 0.8, 0.8))
         canvas.scene(scene)
         window.show()
 
