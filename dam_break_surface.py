@@ -38,7 +38,7 @@ GRID_DIM = int(np.ceil((DOMAIN_MAX - DOMAIN_MIN) / GRID_SIZE)) + 1
 MAX_NEIGHBORS = 96
 MAX_PER_CELL = 96
 
-MC_RES = 40
+MC_RES = 50
 MC_CELL = (DOMAIN_MAX - DOMAIN_MIN) / MC_RES
 MC_SPLAT_RADIUS = H
 
@@ -302,16 +302,8 @@ def initialize():
     print(f"Initialized {n} fluid + {NUM_BOUNDARY} boundary particles")
 
 
-CAM_ANGLE = 0.75
-CAM_TILT = 0.35
-COS_A = math.cos(CAM_ANGLE)
-SIN_A = math.sin(CAM_ANGLE)
-COS_T = math.cos(CAM_TILT)
-SIN_T = math.sin(CAM_TILT)
-# Light direction (world space, normalized) — from upper-right-front
 LIGHT_DIR = np.array([0.4, 0.7, 0.5])
 LIGHT_DIR = LIGHT_DIR / np.linalg.norm(LIGHT_DIR)
-# View direction (into screen after rotation, for specular)
 VIEW_DIR = np.array([0.0, 0.0, 1.0])
 
 RES = 700
@@ -319,32 +311,75 @@ RES = 700
 HALF_VEC = LIGHT_DIR + VIEW_DIR
 HALF_VEC = HALF_VEC / np.linalg.norm(HALF_VEC)
 
+# Mouse interaction force
+MOUSE_RADIUS = 0.2         # world-space radius of influence
+MOUSE_STRENGTH = 3.0       # direct velocity impulse
 
-def transform_verts(verts):
-    """Transform 3D world verts to screen-space (px, py, depth)."""
+mouse_pos = ti.Vector.field(3, dtype=ti.f32, shape=())
+mouse_active = ti.field(dtype=ti.i32, shape=())
+
+
+@ti.kernel
+def apply_mouse_force():
+    """Push particles away from mouse position in world space."""
+    mp = mouse_pos[None]
+    for i in range(NUM_FLUID):
+        r = pos[i] - mp
+        dist = r.norm()
+        if dist < MOUSE_RADIUS and dist > EPSILON:
+            strength = MOUSE_STRENGTH * (1.0 - dist / MOUSE_RADIUS)
+            vel[i] += strength * r / dist
+
+
+def transform_verts(verts, cam_angle, cam_tilt):
+    cos_a = math.cos(cam_angle)
+    sin_a = math.sin(cam_angle)
+    cos_t = math.cos(cam_tilt)
+    sin_t = math.sin(cam_tilt)
     vx = verts[:, 0] - 0.5
     vy = verts[:, 1] - 0.5
     vz = verts[:, 2] - 0.5
-    x_rot = vx * COS_A + vz * SIN_A
-    z_rot = -vx * SIN_A + vz * COS_A
-    y_proj = vy * COS_T - z_rot * SIN_T
-    z_proj = vy * SIN_T + z_rot * COS_T
-    scale = 0.55
+    x_rot = vx * cos_a + vz * sin_a
+    z_rot = -vx * sin_a + vz * cos_a
+    y_proj = vy * cos_t - z_rot * sin_t
+    z_proj = vy * sin_t + z_rot * cos_t
+    scale = 0.85
     sx = (x_rot * scale + 0.5) * RES
     sy = (y_proj * scale + 0.5) * RES
     return np.column_stack([sx, sy, z_proj])
 
 
-def rotate_normals(normals):
-    """Rotate per-vertex normals into view space for shading."""
-    nx = normals[:, 0] * COS_A + normals[:, 2] * SIN_A
-    nz = -normals[:, 0] * SIN_A + normals[:, 2] * COS_A
-    ny_r = normals[:, 1] * COS_T - nz * SIN_T
-    nz_r = normals[:, 1] * SIN_T + nz * COS_T
+def rotate_normals(normals, cam_angle, cam_tilt):
+    cos_a = math.cos(cam_angle)
+    sin_a = math.sin(cam_angle)
+    cos_t = math.cos(cam_tilt)
+    sin_t = math.sin(cam_tilt)
+    nx = normals[:, 0] * cos_a + normals[:, 2] * sin_a
+    nz = -normals[:, 0] * sin_a + normals[:, 2] * cos_a
+    ny_r = normals[:, 1] * cos_t - nz * sin_t
+    nz_r = normals[:, 1] * sin_t + nz * cos_t
     rot = np.column_stack([nx, ny_r, nz_r])
     lengths = np.linalg.norm(rot, axis=1, keepdims=True).clip(1e-8)
     rot /= lengths
     return rot.astype(np.float32)
+
+
+def screen_to_world(sx, sy, cam_angle, cam_tilt):
+    """Unproject normalized screen coords [0,1] to a world-space ray hit on y=0.3 plane."""
+    cos_a = math.cos(cam_angle)
+    sin_a = math.sin(cam_angle)
+    cos_t = math.cos(cam_tilt)
+    sin_t = math.sin(cam_tilt)
+    # Invert the projection: screen -> rotated space
+    scale = 0.85
+    x_rot = (sx - 0.5) / scale
+    y_proj = (sy - 0.5) / scale
+    # Approximate: assume z_rot ~ 0 (center of domain)
+    # y_proj = vy * cos_t - z_rot * sin_t, with z_rot ~ 0 -> vy ~ y_proj / cos_t
+    vy = y_proj / cos_t if abs(cos_t) > 0.01 else 0.0
+    # x_rot = vx * cos_a + vz * sin_a, assume vz ~ 0 -> vx ~ x_rot / cos_a
+    vx = x_rot / cos_a if abs(cos_a) > 0.01 else 0.0
+    return np.array([vx + 0.5, vy + 0.5, 0.5])
 
 
 def main():
@@ -356,9 +391,12 @@ def main():
     paused = False
     frame = 0
     iso_threshold = REST_DENSITY * 0.4
+    cam_angle = 0.75
+    cam_tilt = 0.35
+    rot_speed = 0.05
 
     print(f"Iso threshold = {iso_threshold:.2f}")
-    print("Controls: Space=pause, R=reset, Esc=quit")
+    print("Controls: Arrows=rotate, Space=pause, R=reset, LMB=push water, Esc=quit")
 
     while gui.running:
         for e in gui.get_events(gui.PRESS):
@@ -368,6 +406,24 @@ def main():
                 paused = not paused
             elif e.key == 'r':
                 initialize()
+
+        # Arrow keys for camera (check held state)
+        if gui.is_pressed(gui.LEFT):
+            cam_angle -= rot_speed
+        if gui.is_pressed(gui.RIGHT):
+            cam_angle += rot_speed
+        if gui.is_pressed(gui.UP):
+            cam_tilt = min(cam_tilt + rot_speed, 1.2)
+        if gui.is_pressed(gui.DOWN):
+            cam_tilt = max(cam_tilt - rot_speed, -0.2)
+
+        # Mouse interaction — push water on LMB
+        if gui.is_pressed(gui.LMB):
+            mx, my = gui.get_cursor_pos()
+            wp = screen_to_world(mx, my, cam_angle, cam_tilt)
+            wp = np.clip(wp, 0.0, 1.0)
+            mouse_pos[None] = ti.Vector([float(wp[0]), float(wp[1]), float(wp[2])])
+            apply_mouse_force()
 
         if not paused:
             for _ in range(SUB_STEPS):
@@ -389,8 +445,7 @@ def main():
             verts += DOMAIN_MIN
 
             if len(faces) > 0:
-                # Shade per-vertex, then average per triangle for smooth look
-                rot_n = rotate_normals(normals)
+                rot_n = rotate_normals(normals, cam_angle, cam_tilt)
                 ndotl = np.einsum('ij,j->i', rot_n, LIGHT_DIR).clip(0, 1)
                 ndoth = np.einsum('ij,j->i', rot_n, HALF_VEC).clip(0, 1)
                 spec = ndoth ** 40
@@ -398,19 +453,16 @@ def main():
                 vert_g = (0.12 + 0.25 * ndotl + 0.6 * spec).clip(0, 1)
                 vert_b = (0.25 + 0.40 * ndotl + 0.7 * spec).clip(0, 1)
 
-                # Per-triangle color = average of 3 vertex colors
                 fr = ((vert_r[faces[:, 0]] + vert_r[faces[:, 1]] + vert_r[faces[:, 2]]) / 3.0 * 255).astype(np.int32)
                 fg = ((vert_g[faces[:, 0]] + vert_g[faces[:, 1]] + vert_g[faces[:, 2]]) / 3.0 * 255).astype(np.int32)
                 fb = ((vert_b[faces[:, 0]] + vert_b[faces[:, 1]] + vert_b[faces[:, 2]]) / 3.0 * 255).astype(np.int32)
                 hex_colors = (fr << 16) | (fg << 8) | fb
 
-                # Transform to normalized screen coords [0, 1]
-                screen_verts = transform_verts(verts)
+                screen_verts = transform_verts(verts, cam_angle, cam_tilt)
                 sv = screen_verts.copy()
                 sv[:, 0] /= RES
                 sv[:, 1] /= RES
 
-                # Painter's algorithm
                 face_z = (screen_verts[faces[:, 0], 2] +
                           screen_verts[faces[:, 1], 2] +
                           screen_verts[faces[:, 2], 2]) / 3.0
