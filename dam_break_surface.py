@@ -12,7 +12,7 @@ import numpy as np
 import math
 
 # --- Simulation parameters ---
-NUM_FLUID = 15000
+NUM_FLUID = 70000
 DT = 1.0 / 60.0
 SUB_STEPS = 3
 SOLVER_ITERS = 3
@@ -21,7 +21,7 @@ GRAVITY = ti.Vector([0.0, -9.81, 0.0])
 DOMAIN_MIN = 0.0
 DOMAIN_MAX = 1.0
 
-PARTICLE_RADIUS = 0.015
+PARTICLE_RADIUS = 0.009
 PARTICLE_DIAMETER = 2.0 * PARTICLE_RADIUS
 H = 4.0 * PARTICLE_RADIUS
 H_SQ = H * H
@@ -38,7 +38,7 @@ GRID_DIM = int(np.ceil((DOMAIN_MAX - DOMAIN_MIN) / GRID_SIZE)) + 1
 MAX_NEIGHBORS = 96
 MAX_PER_CELL = 96
 
-MC_RES = 45
+MC_RES = 48
 MC_CELL = (DOMAIN_MAX - DOMAIN_MIN) / MC_RES
 MC_SPLAT_RADIUS = H
 
@@ -302,7 +302,7 @@ axis_y_verts[0] = AXIS_ORIGIN; axis_y_verts[1] = AXIS_ORIGIN + [0.0, AXIS_LEN, 0
 axis_z_verts[0] = AXIS_ORIGIN; axis_z_verts[1] = AXIS_ORIGIN + [0.0, 0.0, AXIS_LEN]
 
 # World-space triangle data from marching cubes
-MAX_MC_TRIS = 200000
+MAX_MC_TRIS = 2000000
 MAX_MC_VERTS = MAX_MC_TRIS * 3
 mc_tri_count = ti.field(dtype=ti.i32, shape=())
 mc_vertices = ti.Vector.field(3, dtype=ti.f32, shape=MAX_MC_VERTS)
@@ -311,7 +311,7 @@ mc_indices = ti.field(dtype=ti.i32, shape=MAX_MC_VERTS)
 
 # Render fields — sized to hold typical MC output. GGUI copies the entire
 # field to a VBO each frame, so oversizing kills framerate.
-RENDER_MAX_VERTS = 150000
+RENDER_MAX_VERTS = 200000
 render_vertices = ti.Vector.field(3, dtype=ti.f32, shape=RENDER_MAX_VERTS)
 render_normals = ti.Vector.field(3, dtype=ti.f32, shape=RENDER_MAX_VERTS)
 render_indices = ti.field(dtype=ti.i32, shape=RENDER_MAX_VERTS)
