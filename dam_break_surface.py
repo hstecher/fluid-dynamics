@@ -15,7 +15,7 @@ import math
 NUM_FLUID = 70000
 DT = 1.0 / 60.0
 SUB_STEPS = 3
-SOLVER_ITERS = 3
+SOLVER_ITERS = 2
 GRAVITY = ti.Vector([0.0, -9.81, 0.0])
 
 DOMAIN_MIN = 0.0
@@ -35,10 +35,10 @@ SPIKY_COEFF = -45.0 / (math.pi * H ** 6)
 
 GRID_SIZE = H
 GRID_DIM = int(np.ceil((DOMAIN_MAX - DOMAIN_MIN) / GRID_SIZE)) + 1
-MAX_NEIGHBORS = 96
-MAX_PER_CELL = 96
+MAX_NEIGHBORS = 48
+MAX_PER_CELL = 48
 
-MC_RES = 48
+MC_RES = 52
 MC_CELL = (DOMAIN_MAX - DOMAIN_MIN) / MC_RES
 MC_SPLAT_RADIUS = H
 
@@ -194,34 +194,33 @@ def predict_positions():
 @ti.kernel
 def compute_lambdas():
     for i in range(NUM_FLUID):
+        pi = pos_pred[i]
         rho_i = MASS * poly6_w(0.0)
-        for k in range(neighbor_count[i]):
-            j = neighbors[i, k]
-            r = pos_pred[i] - pos_pred[j]
-            rho_i += MASS * poly6_w(r.dot(r))
-        C_i = rho_i / REST_DENSITY - 1.0
         grad_sum_sq = 0.0
         grad_ci = ti.Vector([0.0, 0.0, 0.0])
         for k in range(neighbor_count[i]):
             j = neighbors[i, k]
-            r = pos_pred[i] - pos_pred[j]
-            r_len = r.norm()
+            r = pi - pos_pred[j]
+            r_sq = r.dot(r)
+            rho_i += MASS * poly6_w(r_sq)
+            r_len = ti.sqrt(r_sq)
             grad_j = (MASS / REST_DENSITY) * spiky_gradient(r, r_len)
             grad_sum_sq += grad_j.dot(grad_j)
             grad_ci += grad_j
         grad_sum_sq += grad_ci.dot(grad_ci)
+        C_i = rho_i / REST_DENSITY - 1.0
         lambdas[i] = -ti.max(C_i, 0.0) / (grad_sum_sq + CFM)
 
 
 @ti.kernel
 def apply_corrections_and_clamp():
     for i in range(NUM_FLUID):
+        pi = pos_pred[i]
         dp = ti.Vector([0.0, 0.0, 0.0])
         for k in range(neighbor_count[i]):
             j = neighbors[i, k]
-            r = pos_pred[i] - pos_pred[j]
+            r = pi - pos_pred[j]
             r_len = r.norm()
-            # For boundary neighbors, use lambda=0 (they don't move)
             lam_j = 0.0
             if j < NUM_FLUID:
                 lam_j = lambdas[j]
@@ -311,7 +310,7 @@ mc_indices = ti.field(dtype=ti.i32, shape=MAX_MC_VERTS)
 
 # Render fields — sized to hold typical MC output. GGUI copies the entire
 # field to a VBO each frame, so oversizing kills framerate.
-RENDER_MAX_VERTS = 200000
+RENDER_MAX_VERTS = 280000
 render_vertices = ti.Vector.field(3, dtype=ti.f32, shape=RENDER_MAX_VERTS)
 render_normals = ti.Vector.field(3, dtype=ti.f32, shape=RENDER_MAX_VERTS)
 render_indices = ti.field(dtype=ti.i32, shape=RENDER_MAX_VERTS)
